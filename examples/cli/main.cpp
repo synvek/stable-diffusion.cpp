@@ -1136,7 +1136,15 @@ bool load_images_from_dir(const std::string dir,
     return true;
 }
 
-int main(int argc, const char* argv[]) {
+struct ImageData {
+    std::vector<uint8_t> image_data;
+};
+
+struct ImageOutput {
+    std::vector<ImageData*> images;
+};
+
+int main_internal(int argc, const char* argv[], size_t * image_count, ImageOutput ** image_output, bool write_file) {
     SDParams params;
     parse_args(argc, argv, params);
     params.sample_params.guidance.slg.layers                 = params.skip_layers.data();
@@ -1489,31 +1497,75 @@ int main(int argc, const char* argv[]) {
             base_path += file_ext;
             file_ext = ".png";
         }
+        if(!write_file) {
+            *image_output = new ImageOutput();
+        }
         for (int i = 0; i < num_results; i++) {
             if (results[i].data == NULL) {
                 continue;
             }
             std::string final_image_path = i > 0 ? base_path + "_" + std::to_string(i + 1) + file_ext : base_path + file_ext;
-            if (is_jpg) {
-                stbi_write_jpg(final_image_path.c_str(), results[i].width, results[i].height, results[i].channel,
-                               results[i].data, 90, get_image_params(params, params.seed + i).c_str());
-                printf("save result JPEG image to '%s'\n", final_image_path.c_str());
+            if (write_file) {
+                if (is_jpg) {
+                    stbi_write_jpg(final_image_path.c_str(), results[i].width, results[i].height, results[i].channel,
+                                   results[i].data, 90, get_image_params(params, params.seed + i).c_str());
+                    printf("save result JPEG image to '%s'\n", final_image_path.c_str());
+                } else {
+                        stbi_write_png(final_image_path.c_str(), results[i].width, results[i].height, results[i].channel,
+                                       results[i].data, 0, get_image_params(params, params.seed + i).c_str());
+                        printf("save result PNG image to '%s'\n", final_image_path.c_str());
+                }
             } else {
-                stbi_write_png(final_image_path.c_str(), results[i].width, results[i].height, results[i].channel,
-                               results[i].data, 0, get_image_params(params, params.seed + i).c_str());
-                printf("save result PNG image to '%s'\n", final_image_path.c_str());
+                auto image_params = get_image_params(params, params.seed + i);
+                int len;
+                //Only PNG output right now.
+                unsigned char *png = stbi_write_png_to_mem((const unsigned char *) results[i].data, 0, results[i].width, results[i].height, results[i].channel, &len, image_params.c_str());
+                if (png == NULL) {
+                    auto *image_data = new ImageData();
+                    (*image_output)->images.push_back(image_data);
+                } else {
+                    auto *image_data = new ImageData();
+                    image_data->image_data.assign(png, png + len);
+                    (*image_output)->images.push_back(image_data);
+                }
             }
         }
     }
 
-    for (int i = 0; i < num_results; i++) {
-        free(results[i].data);
-        results[i].data = NULL;
+    if (write_file) {
+        for (int i = 0; i < num_results; i++) {
+            free(results[i].data);
+            results[i].data = NULL;
+        }
+        free(results);
+        free_sd_ctx(sd_ctx);
+    } else {
+        *image_count = num_results;
     }
-    free(results);
-    free_sd_ctx(sd_ctx);
+
 
     release_all_resources();
 
     return 0;
+}
+
+int main(int argc, const char* argv[]) {
+    return main_internal(argc, argv, nullptr, nullptr, true);
+}
+
+extern "C" {
+__declspec(dllexport) int generate_image_data(int argc, const char ** argv, size_t * image_count, ImageOutput ** image_output) {
+    return main_internal(argc, argv, image_count, image_output, false);
+}
+
+__declspec(dllexport) void free_image_data(int image_count, ImageOutput* image_output) {
+    if(image_output) {
+        for(auto image_data: image_output->images) {
+            if(image_data) {
+                delete image_data;
+            }
+        }
+        delete image_output;
+    }
+}
 }
