@@ -323,17 +323,18 @@ static std::string utf16_to_utf8(const std::wstring& wstr) {
 }
 
 static std::string argv_to_utf8(int index, const char** argv) {
-    int argc;
-    wchar_t** argv_w = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (!argv_w)
-        throw std::runtime_error("Failed to parse command line");
-
-    std::string result;
-    if (index < argc) {
-        result = utf16_to_utf8(argv_w[index]);
-    }
-    LocalFree(argv_w);
-    return result;
+//    int argc;
+//    wchar_t** argv_w = CommandLineToArgvW(GetCommandLineW(), &argc);
+//    if (!argv_w)
+//        throw std::runtime_error("Failed to parse command line");
+//
+//    std::string result;
+//    if (index < argc) {
+//        result = utf16_to_utf8(argv_w[index]);
+//    }
+//    LocalFree(argv_w);
+//    return result;
+    return std::string(argv[index]);
 }
 
 #else  // Linux / macOS
@@ -1144,7 +1145,7 @@ struct ImageOutput {
     std::vector<ImageData*> images;
 };
 
-int main_internal(int argc, const char* argv[], size_t * image_count, ImageOutput ** image_output, bool write_file) {
+int main_internal(int argc, const char* argv[], ImageOutput * image_output, bool write_file) {
     SDParams params;
     parse_args(argc, argv, params);
     params.sample_params.guidance.slg.layers                 = params.skip_layers.data();
@@ -1497,9 +1498,6 @@ int main_internal(int argc, const char* argv[], size_t * image_count, ImageOutpu
             base_path += file_ext;
             file_ext = ".png";
         }
-        if(!write_file) {
-            *image_output = new ImageOutput();
-        }
         for (int i = 0; i < num_results; i++) {
             if (results[i].data == NULL) {
                 continue;
@@ -1522,26 +1520,22 @@ int main_internal(int argc, const char* argv[], size_t * image_count, ImageOutpu
                 unsigned char *png = stbi_write_png_to_mem((const unsigned char *) results[i].data, 0, results[i].width, results[i].height, results[i].channel, &len, image_params.c_str());
                 if (png == NULL) {
                     auto *image_data = new ImageData();
-                    (*image_output)->images.push_back(image_data);
+                    image_output->images.push_back(image_data);
                 } else {
                     auto *image_data = new ImageData();
                     image_data->image_data.assign(png, png + len);
-                    (*image_output)->images.push_back(image_data);
+                    image_output->images.push_back(image_data);
                 }
             }
         }
     }
 
-    if (write_file) {
-        for (int i = 0; i < num_results; i++) {
-            free(results[i].data);
-            results[i].data = NULL;
-        }
-        free(results);
-        free_sd_ctx(sd_ctx);
-    } else {
-        *image_count = num_results;
+    for (int i = 0; i < num_results; i++) {
+        free(results[i].data);
+        results[i].data = nullptr;
     }
+    free(results);
+    free_sd_ctx(sd_ctx);
 
 
     release_all_resources();
@@ -1550,20 +1544,51 @@ int main_internal(int argc, const char* argv[], size_t * image_count, ImageOutpu
 }
 
 int main(int argc, const char* argv[]) {
-    return main_internal(argc, argv, nullptr, nullptr, true);
+    return main_internal(argc, argv, nullptr, true);
 }
 
 extern "C" {
-__declspec(dllexport) int generate_image_data(int argc, const char ** argv, size_t * image_count, ImageOutput ** image_output) {
-    return main_internal(argc, argv, image_count, image_output, false);
+__declspec(dllexport) ImageOutput * generate_image_data(int argc, const char ** argv) {
+    auto * image_output = new ImageOutput();
+    int result = main_internal(argc, argv, image_output, false);
+    if(result == 0) {
+        return image_output;
+    } else {
+        for(auto image_data: image_output->images) {
+            delete image_data;
+        }
+        delete image_output;
+        return nullptr;
+    }
+}
+__declspec(dllexport) size_t get_image_count(ImageOutput* image_output) {
+    if(image_output) {
+        return image_output->images.size();
+    } else {
+        return 0;
+    }
 }
 
-__declspec(dllexport) void free_image_data(int image_count, ImageOutput* image_output) {
+__declspec(dllexport) uint8_t* get_image_data(ImageOutput* image_output, size_t index) {
+    if(image_output && index < image_output->images.size()) {
+        return image_output->images[index]->image_data.data();
+    } else {
+        return nullptr;
+    }
+}
+
+__declspec(dllexport) size_t get_image_data_length(ImageOutput* image_output, size_t index) {
+    if(image_output && index < image_output->images.size()) {
+        return image_output->images[index]->image_data.size();
+    } else {
+        return 0;
+    }
+}
+
+__declspec(dllexport) void free_image_data(ImageOutput* image_output) {
     if(image_output) {
         for(auto image_data: image_output->images) {
-            if(image_data) {
-                delete image_data;
-            }
+            delete image_data;
         }
         delete image_output;
     }
