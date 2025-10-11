@@ -1547,8 +1547,15 @@ int main(int argc, const char* argv[]) {
     return main_internal(argc, argv, nullptr, true);
 }
 
+#if defined(_WIN32)
+#define EXPORT_FUNC __declspec(dllexport)
+#else
+#define EXPORT_FUNC __attribute__((visiblility("default")))
+#endif
+
+
 extern "C" {
-__declspec(dllexport) ImageOutput * generate_image_data(int argc, const char ** argv) {
+EXPORT_FUNC ImageOutput * generate_image_data(int argc, const char ** argv) {
     auto * image_output = new ImageOutput();
     int result = main_internal(argc, argv, image_output, false);
     if(result == 0) {
@@ -1561,7 +1568,7 @@ __declspec(dllexport) ImageOutput * generate_image_data(int argc, const char ** 
         return nullptr;
     }
 }
-__declspec(dllexport) size_t get_image_count(ImageOutput* image_output) {
+EXPORT_FUNC size_t get_image_count(ImageOutput* image_output) {
     if(image_output) {
         return image_output->images.size();
     } else {
@@ -1569,7 +1576,7 @@ __declspec(dllexport) size_t get_image_count(ImageOutput* image_output) {
     }
 }
 
-__declspec(dllexport) uint8_t* get_image_data(ImageOutput* image_output, size_t index) {
+EXPORT_FUNC uint8_t* get_image_data(ImageOutput* image_output, size_t index) {
     if(image_output && index < image_output->images.size()) {
         return image_output->images[index]->image_data.data();
     } else {
@@ -1577,7 +1584,7 @@ __declspec(dllexport) uint8_t* get_image_data(ImageOutput* image_output, size_t 
     }
 }
 
-__declspec(dllexport) size_t get_image_data_length(ImageOutput* image_output, size_t index) {
+EXPORT_FUNC size_t get_image_data_length(ImageOutput* image_output, size_t index) {
     if(image_output && index < image_output->images.size()) {
         return image_output->images[index]->image_data.size();
     } else {
@@ -1585,7 +1592,7 @@ __declspec(dllexport) size_t get_image_data_length(ImageOutput* image_output, si
     }
 }
 
-__declspec(dllexport) void free_image_data(ImageOutput* image_output) {
+EXPORT_FUNC void free_image_data(ImageOutput* image_output) {
     if(image_output) {
         for(auto image_data: image_output->images) {
             delete image_data;
