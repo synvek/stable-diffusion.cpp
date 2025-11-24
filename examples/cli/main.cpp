@@ -1145,7 +1145,45 @@ struct ImageOutput {
     std::vector<ImageData*> images;
 };
 
-int main_internal(int argc, const char* argv[], ImageOutput * image_output, bool write_file) {
+static sd_ctx_t* g_sd_ctx = nullptr;
+static SDParams g_prev_params;
+static bool g_prev_vae_decode_only = true;
+
+bool should_reload_model(const SDParams& new_params, bool new_vae_decode_only) {
+    if (!g_sd_ctx) return true;
+    if (new_params.model_path != g_prev_params.model_path) return true;
+    if (new_params.clip_l_path != g_prev_params.clip_l_path) return true;
+    if (new_params.clip_g_path != g_prev_params.clip_g_path) return true;
+    if (new_params.clip_vision_path != g_prev_params.clip_vision_path) return true;
+    if (new_params.t5xxl_path != g_prev_params.t5xxl_path) return true;
+    if (new_params.diffusion_model_path != g_prev_params.diffusion_model_path) return true;
+    if (new_params.high_noise_diffusion_model_path != g_prev_params.high_noise_diffusion_model_path) return true;
+    if (new_params.vae_path != g_prev_params.vae_path) return true;
+    if (new_params.taesd_path != g_prev_params.taesd_path) return true;
+    if (new_params.control_net_path != g_prev_params.control_net_path) return true;
+    if (new_params.lora_model_dir != g_prev_params.lora_model_dir) return true;
+    if (new_params.embedding_dir != g_prev_params.embedding_dir) return true;
+    if (new_params.photo_maker_path != g_prev_params.photo_maker_path) return true;
+    if (new_params.n_threads != g_prev_params.n_threads) return true;
+    if (new_params.wtype != g_prev_params.wtype) return true;
+    if (new_params.rng_type != g_prev_params.rng_type) return true;
+    if (new_params.offload_params_to_cpu != g_prev_params.offload_params_to_cpu) return true;
+    if (new_params.clip_on_cpu != g_prev_params.clip_on_cpu) return true;
+    if (new_params.control_net_cpu != g_prev_params.control_net_cpu) return true;
+    if (new_params.vae_on_cpu != g_prev_params.vae_on_cpu) return true;
+    if (new_params.diffusion_flash_attn != g_prev_params.diffusion_flash_attn) return true;
+    if (new_params.diffusion_conv_direct != g_prev_params.diffusion_conv_direct) return true;
+    if (new_params.vae_conv_direct != g_prev_params.vae_conv_direct) return true;
+    if (new_params.chroma_use_dit_mask != g_prev_params.chroma_use_dit_mask) return true;
+    if (new_params.chroma_use_t5_mask != g_prev_params.chroma_use_t5_mask) return true;
+    if (new_params.chroma_t5_mask_pad != g_prev_params.chroma_t5_mask_pad) return true;
+    if (new_params.flow_shift != g_prev_params.flow_shift) return true;
+    if (new_vae_decode_only != g_prev_vae_decode_only) return true;
+
+    return false;
+}
+
+int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool write_file, bool use_cache) {
     SDParams params;
     parse_args(argc, argv, params);
     params.sample_params.guidance.slg.layers                 = params.skip_layers.data();
@@ -1320,44 +1358,65 @@ int main_internal(int argc, const char* argv[], ImageOutput * image_output, bool
         vae_decode_only = false;
     }
 
-    sd_ctx_params_t sd_ctx_params = {
-        params.model_path.c_str(),
-        params.clip_l_path.c_str(),
-        params.clip_g_path.c_str(),
-        params.clip_vision_path.c_str(),
-        params.t5xxl_path.c_str(),
-        params.diffusion_model_path.c_str(),
-        params.high_noise_diffusion_model_path.c_str(),
-        params.vae_path.c_str(),
-        params.taesd_path.c_str(),
-        params.control_net_path.c_str(),
-        params.lora_model_dir.c_str(),
-        params.embedding_dir.c_str(),
-        params.photo_maker_path.c_str(),
-        vae_decode_only,
-        true,
-        params.n_threads,
-        params.wtype,
-        params.rng_type,
-        params.offload_params_to_cpu,
-        params.clip_on_cpu,
-        params.control_net_cpu,
-        params.vae_on_cpu,
-        params.diffusion_flash_attn,
-        params.diffusion_conv_direct,
-        params.vae_conv_direct,
-        params.chroma_use_dit_mask,
-        params.chroma_use_t5_mask,
-        params.chroma_t5_mask_pad,
-        params.flow_shift,
-    };
+    sd_ctx_t* sd_ctx = nullptr;
 
-    sd_ctx_t* sd_ctx = new_sd_ctx(&sd_ctx_params);
+    if (use_cache) {
+        if (should_reload_model(params, vae_decode_only)) {
+            if (g_sd_ctx) {
+                free_sd_ctx(g_sd_ctx);
+                g_sd_ctx = nullptr;
+            }
+        } else {
+            sd_ctx = g_sd_ctx;
+        }
+    }
 
-    if (sd_ctx == NULL) {
-        printf("new_sd_ctx_t failed\n");
-        release_all_resources();
-        return 1;
+    if (!sd_ctx) {
+        sd_ctx_params_t sd_ctx_params = {
+            params.model_path.c_str(),
+            params.clip_l_path.c_str(),
+            params.clip_g_path.c_str(),
+            params.clip_vision_path.c_str(),
+            params.t5xxl_path.c_str(),
+            params.diffusion_model_path.c_str(),
+            params.high_noise_diffusion_model_path.c_str(),
+            params.vae_path.c_str(),
+            params.taesd_path.c_str(),
+            params.control_net_path.c_str(),
+            params.lora_model_dir.c_str(),
+            params.embedding_dir.c_str(),
+            params.photo_maker_path.c_str(),
+            vae_decode_only,
+            true,
+            params.n_threads,
+            params.wtype,
+            params.rng_type,
+            params.offload_params_to_cpu,
+            params.clip_on_cpu,
+            params.control_net_cpu,
+            params.vae_on_cpu,
+            params.diffusion_flash_attn,
+            params.diffusion_conv_direct,
+            params.vae_conv_direct,
+            params.chroma_use_dit_mask,
+            params.chroma_use_t5_mask,
+            params.chroma_t5_mask_pad,
+            params.flow_shift,
+        };
+
+        sd_ctx = new_sd_ctx(&sd_ctx_params);
+
+        if (sd_ctx == NULL) {
+            printf("new_sd_ctx_t failed\n");
+            release_all_resources();
+            return 1;
+        }
+
+        if (use_cache) {
+            g_sd_ctx = sd_ctx;
+            g_prev_params = params;
+            g_prev_vae_decode_only = vae_decode_only;
+        }
     }
 
     if (params.sample_params.sample_method == SAMPLE_METHOD_DEFAULT) {
@@ -1420,7 +1479,9 @@ int main_internal(int argc, const char* argv[], ImageOutput * image_output, bool
 
     if (results == NULL) {
         printf("generate failed\n");
-        free_sd_ctx(sd_ctx);
+        if (!use_cache) {
+            free_sd_ctx(sd_ctx);
+        }
         return 1;
     }
 
@@ -1535,7 +1596,10 @@ int main_internal(int argc, const char* argv[], ImageOutput * image_output, bool
         results[i].data = nullptr;
     }
     free(results);
-    free_sd_ctx(sd_ctx);
+    
+    if (!use_cache) {
+        free_sd_ctx(sd_ctx);
+    }
 
 
     release_all_resources();
@@ -1544,7 +1608,7 @@ int main_internal(int argc, const char* argv[], ImageOutput * image_output, bool
 }
 
 int main(int argc, const char* argv[]) {
-    return main_internal(argc, argv, nullptr, true);
+    return process_logic(argc, argv, nullptr, true, false);
 }
 
 #if defined(_WIN32)
@@ -1557,7 +1621,7 @@ int main(int argc, const char* argv[]) {
 extern "C" {
 EXPORT_FUNC ImageOutput * generate_image_data(int argc, const char ** argv) {
     auto * image_output = new ImageOutput();
-    int result = main_internal(argc, argv, image_output, false);
+    int result = process_logic(argc, argv, image_output, false, false);
     if(result == 0) {
         return image_output;
     } else {
