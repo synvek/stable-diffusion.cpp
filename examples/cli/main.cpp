@@ -1183,7 +1183,7 @@ bool should_reload_model(const SDParams& new_params, bool new_vae_decode_only) {
     return false;
 }
 
-int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool write_file, bool use_cache) {
+int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool write_file, bool use_cache, bool use_log_callback) {
     SDParams params;
     parse_args(argc, argv, params);
     params.sample_params.guidance.slg.layers                 = params.skip_layers.data();
@@ -1191,7 +1191,9 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
     params.high_noise_sample_params.guidance.slg.layers      = params.high_noise_skip_layers.data();
     params.high_noise_sample_params.guidance.slg.layer_count = params.high_noise_skip_layers.size();
 
-    sd_set_log_callback(sd_log_cb, (void*)&params);
+    if(use_log_callback) {
+        sd_set_log_callback(sd_log_cb, (void*)&params);
+    }
 
     if (params.verbose) {
         print_params(params);
@@ -1608,7 +1610,7 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
 }
 
 int main(int argc, const char* argv[]) {
-    return process_logic(argc, argv, nullptr, true, false);
+    return process_logic(argc, argv, nullptr, true, false, true);
 }
 
 #if defined(_WIN32)
@@ -1617,11 +1619,26 @@ int main(int argc, const char* argv[]) {
 #define EXPORT_FUNC __attribute__((visiblility("default")))
 #endif
 
+typedef void (*LogCallback)(int log_level, const char* log_message);
+
+static LogCallback log_call_back = nullptr;
+
+
+static void customize_log_callback(sd_log_level_t level, const char * text, void * user_data) {
+    //fprintf(stderr, "stable-diffusion.cpp===============> log callback is called here: %s", text);
+    if (log_call_back) {
+        //sd has no log_level_none = 0 and we need + 1 here to consistent with llama.cpp log config
+        log_call_back(level + 1, text);
+    } else {
+        fprintf(stderr, "%s", text);
+    }
+}
 
 extern "C" {
 EXPORT_FUNC ImageOutput * generate_image_data(int argc, const char ** argv) {
+    sd_set_log_callback(customize_log_callback, nullptr);
     auto * image_output = new ImageOutput();
-    int result = process_logic(argc, argv, image_output, false, false);
+    int result = process_logic(argc, argv, image_output, false, false, false);
     if(result == 0) {
         return image_output;
     } else {
@@ -1664,4 +1681,18 @@ EXPORT_FUNC void free_image_data(ImageOutput* image_output) {
         delete image_output;
     }
 }
+
+
+EXPORT_FUNC void init_log_callback(LogCallback cb) {
+    log_call_back = cb;
+    std::cout << "C++: Rust callback has been set." << std::endl;
+}
+
+EXPORT_FUNC void cleanup_log_callback() {
+    if (log_call_back) {
+        log_call_back = nullptr;
+        std::cout << "C++: Rust callback has been cleared." << std::endl;
+    }
+}
+
 }
