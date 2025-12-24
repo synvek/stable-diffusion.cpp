@@ -406,7 +406,20 @@ struct ImageOutput {
     std::vector<ImageData*> images;
 };
 
-int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool write_file, bool use_cache, bool use_log_callback) {
+typedef struct RefImageData {
+    int width;
+    int height;
+    char* data;
+    int data_len;
+} RefImage;
+
+typedef struct RefImageDataArray {
+    RefImage* images;
+    int len;
+    int capacity;
+} RefImageDataArray;
+
+int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool write_file, bool use_cache, bool use_log_callback, std::vector<RefImageData> &with_ref_images) {
     if (argc > 1 && std::string(argv[1]) == "--version") {
         std::cout << version_string() << "\n";
         return EXIT_SUCCESS;
@@ -587,6 +600,19 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
                                   (uint32_t)height,
                                   3,
                                   image_buffer});
+        }
+    }
+    if (!with_ref_images.empty()) {
+        vae_decode_only = false;
+        for (auto& ref_image : with_ref_images) {
+            int img_width           = ref_image.width;
+            int img_height           = ref_image.height;
+            int img_length = ref_image.data_len;
+            uint8_t* raw_pixels = load_image_from_memory((const char *)ref_image.data, img_length, img_width, img_height);
+            if (!raw_pixels) {
+                continue;
+            }
+            ref_images.push_back({(uint32_t)img_width, (uint32_t)img_height, 3, (uint8_t*)raw_pixels});
         }
     }
 
@@ -843,7 +869,8 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
 }
 
 int main(int argc, const char* argv[]) {
-    return process_logic(argc, argv, nullptr, true, false, true);
+    std::vector<RefImageData> with_ref_images;
+    return process_logic(argc, argv, nullptr, true, false, true, with_ref_images);
 }
 
 #if defined(_WIN32)
@@ -856,7 +883,6 @@ typedef void (*LogCallback)(int log_level, const char* log_message);
 
 static LogCallback log_call_back = nullptr;
 
-
 static void customize_log_callback(sd_log_level_t level, const char * text, void * user_data) {
     //fprintf(stderr, "stable-diffusion.cpp===============> log callback is called here: %s", text);
     if (log_call_back) {
@@ -868,10 +894,17 @@ static void customize_log_callback(sd_log_level_t level, const char * text, void
 }
 
 extern "C" {
-EXPORT_FUNC ImageOutput * generate_image_data(int argc, const char ** argv) {
+EXPORT_FUNC ImageOutput * generate_image_data(int argc, const char ** argv, const RefImageDataArray* refImages) {
     sd_set_log_callback(customize_log_callback, nullptr);
+    std::vector<RefImageData> with_ref_images;
     auto * image_output = new ImageOutput();
-    int result = process_logic(argc, argv, image_output, false, false, false);
+    if(refImages) {
+        for (size_t i = 0; i < refImages->len; i++) {
+            const RefImage& refImage = refImages->images[i];
+            with_ref_images.push_back({refImage.width, refImage.height, refImage.data, refImage.data_len});
+        }
+    }
+    int result = process_logic(argc, argv, image_output, false, false, false, with_ref_images);
     if(result == 0) {
         return image_output;
     } else {
