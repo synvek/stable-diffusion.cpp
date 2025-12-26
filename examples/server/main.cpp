@@ -299,13 +299,15 @@ void sd_log_cb(enum sd_log_level_t level, const char* log, void* data) {
     fflush(out_stream);
 }
 
-int main(int argc, const char** argv) {
+int main_internal(int argc, const char** argv, bool enable_log_callback) {
     SDSvrParams svr_params;
     SDContextParams ctx_params;
     SDGenerationParams default_gen_params;
     parse_args(argc, argv, svr_params, ctx_params, default_gen_params);
 
-    sd_set_log_callback(sd_log_cb, (void*)&svr_params);
+    if(enable_log_callback) {
+        sd_set_log_callback(sd_log_cb, (void*)&svr_params);
+    }
 
     if (svr_params.verbose) {
         printf("%s", sd_get_system_info());
@@ -741,4 +743,47 @@ int main(int argc, const char** argv) {
     // cleanup
     free_sd_ctx(sd_ctx);
     return 0;
+}
+
+int main(int argc, const char ** argv) {
+    return main_internal(argc, argv, true);
+}
+
+#if defined(_WIN32)
+#define EXPORT_FUNC __declspec(dllexport)
+#else
+#define EXPORT_FUNC __attribute__((visiblility("default")))
+#endif
+
+typedef void (*LogCallback)(int log_level, const char* log_message);
+
+static LogCallback log_call_back = nullptr;
+
+static void customize_log_callback(sd_log_level_t level, const char * text, void * user_data) {
+    sd_log_level_t log_level = level;
+    if (log_call_back) {
+        log_call_back(log_level, text);
+    } else {
+        fprintf(stderr, "%s", text);
+    }
+}
+
+extern "C" {
+EXPORT_FUNC int start_sd_server(int argc, const char ** argv) {
+    sd_set_log_callback(customize_log_callback, nullptr);
+
+    return main_internal(argc, argv, false);
+}
+
+EXPORT_FUNC void init_log_callback(LogCallback cb) {
+    log_call_back = cb;
+    std::cout << "C++: Rust callback has been set." << std::endl;
+}
+
+EXPORT_FUNC void cleanup_log_callback() {
+    if (log_call_back) {
+        log_call_back = nullptr;
+        std::cout << "C++: Rust callback has been cleared." << std::endl;
+    }
+}
 }
