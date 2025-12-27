@@ -214,4 +214,199 @@ int create_mjpg_avi_from_sd_images(const char* filename, sd_image_t* images, int
     return 0;
 }
 
+// Write 32-bit little-endian integer to vector
+void write_u32_le_vec(std::vector<uint8_t>& vec, uint32_t val) {
+    vec.push_back(val & 0xFF);
+    vec.push_back((val >> 8) & 0xFF);
+    vec.push_back((val >> 16) & 0xFF);
+    vec.push_back((val >> 24) & 0xFF);
+}
+
+// Write 16-bit little-endian integer to vector
+void write_u16_le_vec(std::vector<uint8_t>& vec, uint16_t val) {
+    vec.push_back(val & 0xFF);
+    vec.push_back((val >> 8) & 0xFF);
+}
+
+/**
+ * Create an MJPG AVI data in memory from an array of sd_image_t images.
+ * Images are encoded to JPEG using stb_image_write.
+ *
+ * @param output_vec Output vector to store AVI data.
+ * @param images Array of input images.
+ * @param num_images Number of images in the array.
+ * @param fps Frames per second for the video.
+ * @param quality JPEG quality (0-100).
+ * @return 0 on success, -1 on failure.
+ */
+int create_mjpg_avi_to_memory(std::vector<uint8_t>& output_vec, sd_image_t* images, int num_images, int fps, int quality = 90) {
+    if (num_images == 0) {
+        fprintf(stderr, "Error: Image array is empty.\n");
+        return -1;
+    }
+
+    uint32_t width    = images[0].width;
+    uint32_t height   = images[0].height;
+    uint32_t channels = images[0].channel;
+    if (channels != 3 && channels != 4) {
+        fprintf(stderr, "Error: Unsupported channel count: %u\n", channels);
+        return -1;
+    }
+
+    output_vec.clear();
+
+    // --- RIFF AVI Header ---
+    output_vec.insert(output_vec.end(), {'R', 'I', 'F', 'F'});
+    size_t riff_size_pos = output_vec.size();
+    write_u32_le_vec(output_vec, 0);  // Placeholder for file size
+    output_vec.insert(output_vec.end(), {'A', 'V', 'I', ' '});
+
+    // 'hdrl' LIST (header list)
+    output_vec.insert(output_vec.end(), {'L', 'I', 'S', 'T'});
+    write_u32_le_vec(output_vec, 4 + 8 + 56 + 8 + 4 + 8 + 56 + 8 + 40);
+    output_vec.insert(output_vec.end(), {'h', 'd', 'r', 'l'});
+
+    // 'avih' chunk (AVI main header)
+    output_vec.insert(output_vec.end(), {'a', 'v', 'i', 'h'});
+    write_u32_le_vec(output_vec, 56);
+    write_u32_le_vec(output_vec, 1000000 / fps);       // Microseconds per frame
+    write_u32_le_vec(output_vec, 0);                   // Max bytes per second
+    write_u32_le_vec(output_vec, 0);                   // Padding granularity
+    write_u32_le_vec(output_vec, 0x110);               // Flags (HASINDEX | ISINTERLEAVED)
+    write_u32_le_vec(output_vec, num_images);          // Total frames
+    write_u32_le_vec(output_vec, 0);                   // Initial frames
+    write_u32_le_vec(output_vec, 1);                   // Number of streams
+    write_u32_le_vec(output_vec, width * height * 3);  // Suggested buffer size
+    write_u32_le_vec(output_vec, width);
+    write_u32_le_vec(output_vec, height);
+    write_u32_le_vec(output_vec, 0);  // Reserved
+    write_u32_le_vec(output_vec, 0);  // Reserved
+    write_u32_le_vec(output_vec, 0);  // Reserved
+    write_u32_le_vec(output_vec, 0);  // Reserved
+
+    // 'strl' LIST (stream list)
+    output_vec.insert(output_vec.end(), {'L', 'I', 'S', 'T'});
+    write_u32_le_vec(output_vec, 4 + 8 + 56 + 8 + 40);
+    output_vec.insert(output_vec.end(), {'s', 't', 'r', 'l'});
+
+    // 'strh' chunk (stream header)
+    output_vec.insert(output_vec.end(), {'s', 't', 'r', 'h'});
+    write_u32_le_vec(output_vec, 56);
+    output_vec.insert(output_vec.end(), {'v', 'i', 'd', 's'});  // Stream type: video
+    output_vec.insert(output_vec.end(), {'M', 'J', 'P', 'G'});  // Codec: Motion JPEG
+    write_u32_le_vec(output_vec, 0);                            // Flags
+    write_u16_le_vec(output_vec, 0);                            // Priority
+    write_u16_le_vec(output_vec, 0);                            // Language
+    write_u32_le_vec(output_vec, 0);                            // Initial frames
+    write_u32_le_vec(output_vec, 1);                            // Scale
+    write_u32_le_vec(output_vec, fps);                          // Rate
+    write_u32_le_vec(output_vec, 0);                            // Start
+    write_u32_le_vec(output_vec, num_images);                   // Length
+    write_u32_le_vec(output_vec, width * height * 3);           // Suggested buffer size
+    write_u32_le_vec(output_vec, (uint32_t)-1);                 // Quality
+    write_u32_le_vec(output_vec, 0);                            // Sample size
+    write_u16_le_vec(output_vec, 0);                            // rcFrame.left
+    write_u16_le_vec(output_vec, 0);                            // rcFrame.top
+    write_u16_le_vec(output_vec, 0);                            // rcFrame.right
+    write_u16_le_vec(output_vec, 0);                            // rcFrame.bottom
+
+    // 'strf' chunk (stream format: BITMAPINFOHEADER)
+    output_vec.insert(output_vec.end(), {'s', 't', 'r', 'f'});
+    write_u32_le_vec(output_vec, 40);
+    write_u32_le_vec(output_vec, 40);  // biSize
+    write_u32_le_vec(output_vec, width);
+    write_u32_le_vec(output_vec, height);
+    write_u16_le_vec(output_vec, 1);                   // biPlanes
+    write_u16_le_vec(output_vec, 24);                  // biBitCount
+    output_vec.insert(output_vec.end(), {'M', 'J', 'P', 'G'});  // biCompression (FOURCC)
+    write_u32_le_vec(output_vec, width * height * 3);  // biSizeImage
+    write_u32_le_vec(output_vec, 0);                   // XPelsPerMeter
+    write_u32_le_vec(output_vec, 0);                   // YPelsPerMeter
+    write_u32_le_vec(output_vec, 0);                   // Colors used
+    write_u32_le_vec(output_vec, 0);                   // Colors important
+
+    // 'movi' LIST (video frames)
+    output_vec.insert(output_vec.end(), {'L', 'I', 'S', 'T'});
+    size_t movi_size_pos = output_vec.size();
+    write_u32_le_vec(output_vec, 0);  // Placeholder for movi size
+    output_vec.insert(output_vec.end(), {'m', 'o', 'v', 'i'});
+
+    avi_index_entry* index = (avi_index_entry*)malloc(sizeof(avi_index_entry) * num_images);
+    if (!index) {
+        return -1;
+    }
+
+    // Encode and write each frame as JPEG
+    struct {
+        uint8_t* buf;
+        size_t size;
+    } jpeg_data;
+
+    for (int i = 0; i < num_images; i++) {
+        jpeg_data.buf  = nullptr;
+        jpeg_data.size = 0;
+
+        // Callback function to collect JPEG data into memory
+        auto write_to_buf = [](void* context, void* data, int size) {
+            auto jd = (decltype(jpeg_data)*)context;
+            jd->buf = (uint8_t*)realloc(jd->buf, jd->size + size);
+            memcpy(jd->buf + jd->size, data, size);
+            jd->size += size;
+        };
+
+        // Encode to JPEG in memory
+        stbi_write_jpg_to_func(
+            write_to_buf,
+            &jpeg_data,
+            images[i].width,
+            images[i].height,
+            channels,
+            images[i].data,
+            quality);
+
+        // Write '00dc' chunk (video frame)
+        output_vec.insert(output_vec.end(), {'0', '0', 'd', 'c'});
+        write_u32_le_vec(output_vec, jpeg_data.size);
+        index[i].offset = output_vec.size() - 8;
+        index[i].size   = jpeg_data.size;
+        output_vec.insert(output_vec.end(), jpeg_data.buf, jpeg_data.buf + jpeg_data.size);
+
+        // Align to even byte size
+        if (jpeg_data.size % 2)
+            output_vec.push_back(0);
+
+        free(jpeg_data.buf);
+    }
+
+    // Finalize 'movi' size
+    size_t cur_pos   = output_vec.size();
+    uint32_t movi_size = cur_pos - movi_size_pos - 4;
+    output_vec[movi_size_pos]     = movi_size & 0xFF;
+    output_vec[movi_size_pos + 1] = (movi_size >> 8) & 0xFF;
+    output_vec[movi_size_pos + 2] = (movi_size >> 16) & 0xFF;
+    output_vec[movi_size_pos + 3] = (movi_size >> 24) & 0xFF;
+
+    // Write 'idx1' index
+    output_vec.insert(output_vec.end(), {'i', 'd', 'x', '1'});
+    write_u32_le_vec(output_vec, num_images * 16);
+    for (int i = 0; i < num_images; i++) {
+        output_vec.insert(output_vec.end(), {'0', '0', 'd', 'c'});
+        write_u32_le_vec(output_vec, 0x10);
+        write_u32_le_vec(output_vec, index[i].offset);
+        write_u32_le_vec(output_vec, index[i].size);
+    }
+
+    // Finalize RIFF size
+    cur_pos            = output_vec.size();
+    uint32_t file_size = cur_pos - riff_size_pos - 4;
+    output_vec[riff_size_pos]     = file_size & 0xFF;
+    output_vec[riff_size_pos + 1] = (file_size >> 8) & 0xFF;
+    output_vec[riff_size_pos + 2] = (file_size >> 16) & 0xFF;
+    output_vec[riff_size_pos + 3] = (file_size >> 24) & 0xFF;
+
+    free(index);
+
+    return 0;
+}
+
 #endif  // __AVI_WRITER_H__
