@@ -419,7 +419,8 @@ typedef struct RefImageDataArray {
     int capacity;
 } RefImageDataArray;
 
-int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool write_file, bool use_cache, bool use_log_callback, std::vector<RefImageData> &with_ref_images) {
+int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool write_file, bool use_cache, bool use_log_callback, std::vector<RefImageData> &with_ref_images
+                  , std::vector<RefImageData> &with_input_images) {
     if (argc > 1 && std::string(argv[1]) == "--version") {
         std::cout << version_string() << "\n";
         return EXIT_SUCCESS;
@@ -528,6 +529,19 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
         init_image.data = load_image_from_file(gen_params.init_image_path.c_str(), width, height, gen_params.width, gen_params.height);
         if (init_image.data == nullptr) {
             fprintf(stderr, "load image from '%s' failed\n", gen_params.init_image_path.c_str());
+            release_all_resources();
+            return 1;
+        }
+    }
+    if (!with_input_images.empty()) {
+        vae_decode_only = false;
+        auto& input_image =with_input_images[0];
+        int img_width           = input_image.width;
+        int img_height           = input_image.height;
+        int img_length = input_image.data_len;
+        init_image.data = load_image_from_memory((const char *)input_image.data, img_length, img_width, img_height);
+        if (init_image.data) {
+            fprintf(stderr, "load init image failed\n");
             release_all_resources();
             return 1;
         }
@@ -816,8 +830,16 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
         if (file_ext_lower == ".png") {
             vid_output_path = base_path + ".avi";
         }
-        create_mjpg_avi_from_sd_images(vid_output_path.c_str(), results, num_results, gen_params.fps);
-        printf("save result MJPG AVI video to '%s'\n", vid_output_path.c_str());
+        if (write_file) {
+            create_mjpg_avi_from_sd_images(vid_output_path.c_str(), results, num_results, gen_params.fps);
+            printf("save result MJPG AVI video to '%s'\n", vid_output_path.c_str());
+        } else {
+            auto *image_data = new ImageData();
+            //image_data->image_data.assign(png, png + len);
+            image_output->images.push_back(image_data);
+            //create_mjpg_avi_from_sd_images(vid_output_path.c_str(), results, num_results, gen_params.fps);
+            //printf("save result MJPG AVI video to '%s'\n", vid_output_path.c_str());
+        }
     } else {
         // appending ".png" to absent or unknown extension
         if (!is_jpg && file_ext_lower != ".png") {
@@ -870,7 +892,8 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
 
 int main(int argc, const char* argv[]) {
     std::vector<RefImageData> with_ref_images;
-    return process_logic(argc, argv, nullptr, true, false, true, with_ref_images);
+    std::vector<RefImageData> with_input_images;
+    return process_logic(argc, argv, nullptr, true, false, true, with_ref_images, with_input_images);
 }
 
 #if defined(_WIN32)
@@ -894,9 +917,10 @@ static void customize_log_callback(sd_log_level_t level, const char * text, void
 }
 
 extern "C" {
-EXPORT_FUNC ImageOutput * generate_image_data(int argc, const char ** argv, const RefImageDataArray* refImages) {
+EXPORT_FUNC ImageOutput * generate_image_data(int argc, const char ** argv, const RefImageDataArray* refImages, const RefImageDataArray* inputImages) {
     sd_set_log_callback(customize_log_callback, nullptr);
     std::vector<RefImageData> with_ref_images;
+    std::vector<RefImageData> with_input_images;
     auto * image_output = new ImageOutput();
     if(refImages) {
         for (size_t i = 0; i < refImages->len; i++) {
@@ -904,7 +928,13 @@ EXPORT_FUNC ImageOutput * generate_image_data(int argc, const char ** argv, cons
             with_ref_images.push_back({refImage.width, refImage.height, refImage.data, refImage.data_len});
         }
     }
-    int result = process_logic(argc, argv, image_output, false, false, false, with_ref_images);
+    if(inputImages) {
+        for (size_t i = 0; i < inputImages->len; i++) {
+            const RefImage& inputImage = inputImages->images[i];
+            with_input_images.push_back({inputImage.width, inputImage.height, inputImage.data, inputImage.data_len});
+        }
+    }
+    int result = process_logic(argc, argv, image_output, false, false, false, with_ref_images, with_input_images);
     if(result == 0) {
         return image_output;
     } else {
