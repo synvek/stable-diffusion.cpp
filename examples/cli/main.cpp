@@ -834,9 +834,23 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
             create_mjpg_avi_from_sd_images(vid_output_path.c_str(), results, num_results, gen_params.fps);
             printf("save result MJPG AVI video to '%s'\n", vid_output_path.c_str());
         } else {
-            auto *image_data = new ImageData();
-            create_mjpg_avi_to_memory(image_data->image_data, results, num_results, gen_params.fps);
-            image_output->images.push_back(image_data);
+            for (int i = 0; i < num_results; i++) {
+                if (results[i].data == nullptr) {
+                    continue;
+                }
+                auto image_params = get_image_params(cli_params, ctx_params, gen_params, gen_params.seed + i);
+                int len;
+                //require png output right now.
+                unsigned char *png = stbi_write_png_to_mem((const unsigned char *) results[i].data, 0, results[i].width, results[i].height, results[i].channel, &len, image_params.c_str());
+                if (png == NULL) {
+                    auto *image_data = new ImageData();
+                    image_output->images.push_back(image_data);
+                } else {
+                    auto *image_data = new ImageData();
+                    image_data->image_data.assign(png, png + len);
+                    image_output->images.push_back(image_data);
+                }
+            }
         }
     } else {
         // appending ".png" to absent or unknown extension
