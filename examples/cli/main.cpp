@@ -419,8 +419,10 @@ typedef struct RefImageDataArray {
     int capacity;
 } RefImageDataArray;
 
-int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool write_file, bool use_cache, bool use_log_callback, std::vector<RefImageData> &with_ref_images
-                  , std::vector<RefImageData> &with_init_images) {
+int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool write_file, bool use_cache, bool use_log_callback
+                  , std::vector<RefImageData> &with_ref_images, std::vector<RefImageData> &with_init_images
+                  , std::vector<RefImageData> &with_end_images, std::vector<RefImageData> &with_mask_images
+                  , std::vector<RefImageData> &with_control_images, std::vector<RefImageData> &with_control_video_images) {
     if (argc > 1 && std::string(argv[1]) == "--version") {
         std::cout << version_string() << "\n";
         return EXIT_SUCCESS;
@@ -905,7 +907,11 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
 int main(int argc, const char* argv[]) {
     std::vector<RefImageData> with_ref_images;
     std::vector<RefImageData> with_input_images;
-    return process_logic(argc, argv, nullptr, true, false, true, with_ref_images, with_input_images);
+    std::vector<RefImageData> with_end_images;
+    std::vector<RefImageData> with_mask_images;
+    std::vector<RefImageData> with_control_images;
+    std::vector<RefImageData> with_control_video_images;
+    return process_logic(argc, argv, nullptr, true, false, true, with_ref_images, with_input_images,  with_end_images, with_mask_images, with_control_images, with_control_video_images);
 }
 
 #if defined(_WIN32)
@@ -929,10 +935,16 @@ static void customize_log_callback(sd_log_level_t level, const char * text, void
 }
 
 extern "C" {
-EXPORT_FUNC ImageOutput * generate_image_data(int argc, const char ** argv, const RefImageDataArray* refImages, const RefImageDataArray* initImages) {
+EXPORT_FUNC ImageOutput * generate_image_data(int argc, const char ** argv, const RefImageDataArray* refImages, const RefImageDataArray* initImages
+                                             , const RefImageDataArray* endImages, const RefImageDataArray* maskImages, const RefImageDataArray* controlImages
+                                             , const RefImageDataArray* controlVideoImages) {
     sd_set_log_callback(customize_log_callback, nullptr);
     std::vector<RefImageData> with_ref_images;
     std::vector<RefImageData> with_init_images;
+    std::vector<RefImageData> with_end_images;
+    std::vector<RefImageData> with_mask_images;
+    std::vector<RefImageData> with_control_images;
+    std::vector<RefImageData> with_control_video_images;
     auto * image_output = new ImageOutput();
     if(refImages) {
         for (size_t i = 0; i < refImages->len; i++) {
@@ -946,7 +958,31 @@ EXPORT_FUNC ImageOutput * generate_image_data(int argc, const char ** argv, cons
             with_init_images.push_back({inputImage.width, inputImage.height, inputImage.data, inputImage.data_len});
         }
     }
-    int result = process_logic(argc, argv, image_output, false, false, false, with_ref_images, with_init_images);
+    if(endImages) {
+        for (size_t i = 0; i < endImages->len; i++) {
+            const RefImage& inputImage = endImages->images[i];
+            with_end_images.push_back({inputImage.width, inputImage.height, inputImage.data, inputImage.data_len});
+        }
+    }
+    if(maskImages) {
+        for (size_t i = 0; i < maskImages->len; i++) {
+            const RefImage& inputImage = maskImages->images[i];
+            with_mask_images.push_back({inputImage.width, inputImage.height, inputImage.data, inputImage.data_len});
+        }
+    }
+    if(controlImages) {
+        for (size_t i = 0; i < controlImages->len; i++) {
+            const RefImage& inputImage = controlImages->images[i];
+            with_control_images.push_back({inputImage.width, inputImage.height, inputImage.data, inputImage.data_len});
+        }
+    }
+    if(controlVideoImages) {
+        for (size_t i = 0; i < controlVideoImages->len; i++) {
+            const RefImage& inputImage = controlVideoImages->images[i];
+            with_control_video_images.push_back({inputImage.width, inputImage.height, inputImage.data, inputImage.data_len});
+        }
+    }
+    int result = process_logic(argc, argv, image_output, false, false, false, with_ref_images, with_init_images,  with_end_images, with_mask_images, with_control_images, with_control_video_images);
     if(result == 0) {
         return image_output;
     } else {
