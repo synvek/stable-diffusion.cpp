@@ -15,9 +15,12 @@
 // #include "preprocessing.hpp"
 #include "stable-diffusion.h"
 
-#include "common/common.hpp"
+#include "common/common.h"
+#include "common/media_io.h"
+#include "common/resource_owners.hpp"
+#include "image_metadata.h"
 
-#include "avi_writer.h"
+namespace fs = std::filesystem;
 
 const char* previews_str[] = {
     "none",
@@ -26,13 +29,18 @@ const char* previews_str[] = {
     "vae",
 };
 
+std::regex format_specifier_regex("(?:[^%]|^)(?:%%)*(%\\d{0,3}d)");
+
 struct SDCliParams {
     SDMode mode             = IMG_GEN;
     std::string output_path = "output.png";
+    int output_begin_idx    = -1;
+    std::string image_path;
+    std::string metadata_format = "text";
 
     bool verbose          = false;
-    bool version          = false;
     bool canny_preprocess = false;
+    bool convert_name     = false;
 
     preview_t preview_method = PREVIEW_NONE;
     int preview_interval     = 1;
@@ -41,6 +49,9 @@ struct SDCliParams {
     bool taesd_preview       = false;
     bool preview_noisy       = false;
     bool color               = false;
+    bool metadata_raw        = false;
+    bool metadata_brief      = false;
+    bool metadata_all        = false;
 
     bool normal_exit = false;
 
@@ -50,11 +61,19 @@ struct SDCliParams {
         options.string_options = {
             {"-o",
              "--output",
-             "path to write result image to (default: ./output.png)",
+             "path to write result image to. you can use printf-style %d format specifiers for image sequences (default: ./output.png) (eg. output_%03d.png). Single-file video outputs support .avi, .webm, and animated .webp",
              &output_path},
             {"",
+             "--image",
+             "path to the image to inspect (for metadata mode)",
+             &image_path},
+            {"",
+             "--metadata-format",
+             "metadata output format, one of [text, json] (default: text)",
+             &metadata_format},
+            {"",
              "--preview-path",
-             "path to write preview image to (default: ./preview.png)",
+             "path to write preview image to (default: ./preview.png). Multi-frame previews support .avi, .webm, and animated .webp",
              &preview_path},
         };
 
@@ -63,6 +82,10 @@ struct SDCliParams {
              "--preview-interval",
              "interval in denoising steps between consecutive updates of the image preview file (default is 1, meaning updating at every step)",
              &preview_interval},
+            {"",
+             "--output-begin-idx",
+             "starting index for output image sequence, must be non-negative (default 0 if specified %d in output path, 1 otherwise)",
+             &output_begin_idx},
         };
 
         options.bool_options = {
@@ -70,14 +93,14 @@ struct SDCliParams {
              "--canny",
              "apply canny preprocessor (edge detection)",
              true, &canny_preprocess},
+            {"",
+             "--convert-name",
+             "convert tensor name (for convert mode)",
+             true, &convert_name},
             {"-v",
              "--verbose",
              "print extra info",
              true, &verbose},
-            {"",
-             "--version",
-             "print stable-diffusion.cpp version",
-             true, &version},
             {"",
              "--color",
              "colors the logging tags according to level",
@@ -90,6 +113,18 @@ struct SDCliParams {
              "--preview-noisy",
              "enables previewing noisy inputs of the models rather than the denoised outputs",
              true, &preview_noisy},
+            {"",
+             "--metadata-raw",
+             "include raw hex previews for unparsed metadata payloads",
+             true, &metadata_raw},
+            {"",
+             "--metadata-brief",
+             "truncate long metadata text values in text output",
+             true, &metadata_brief},
+            {"",
+             "--metadata-all",
+             "include structural/container entries such as IHDR, IDAT, and non-metadata JPEG segments",
+             true, &metadata_all},
 
         };
 
@@ -106,9 +141,8 @@ struct SDCliParams {
                     }
                 }
                 if (mode_found == -1) {
-                    fprintf(stderr,
-                            "error: invalid mode %s, must be one of [%s]\n",
-                            mode_c_str, SD_ALL_MODES_STR);
+                    LOG_ERROR("error: invalid mode %s, must be one of [%s]\n",
+                              mode_c_str, SD_ALL_MODES_STR);
                     exit(1);
                 }
                 mode = (SDMode)mode_found;
@@ -128,23 +162,23 @@ struct SDCliParams {
                 }
             }
             if (preview_found == -1) {
-                fprintf(stderr, "error: preview method %s\n",
-                        preview);
+                LOG_ERROR("error: preview method %s", preview);
                 return -1;
             }
             preview_method = (preview_t)preview_found;
             return 1;
         };
 
-        auto on_help_arg = [&](int argc, const char** argv, int index) {
+        auto on_help_arg = [&](int argc, const char** argv, int index, bool& valid) {
             normal_exit = true;
+            valid       = true;
             return -1;
         };
 
         options.manual_options = {
             {"-M",
              "--mode",
-             "run mode, one of [img_gen, vid_gen, upscale, convert], default: img_gen",
+             "run mode, one of [img_gen, vid_gen, upscale, convert, metadata], default: img_gen",
              on_mode_arg},
             {"",
              "--preview",
@@ -159,16 +193,41 @@ struct SDCliParams {
         return options;
     };
 
-    bool process_and_check() {
-        if (output_path.length() == 0) {
-            fprintf(stderr, "error: the following arguments are required: output_path\n");
-            return false;
-        }
-
+    bool resolve() {
         if (mode == CONVERT) {
             if (output_path == "output.png") {
                 output_path = "output.gguf";
             }
+        }
+        return true;
+    }
+
+    bool validate() {
+        if (mode != METADATA) {
+            if (output_path.length() == 0) {
+                LOG_ERROR("error: the following arguments are required: output_path");
+                return false;
+            }
+        } else {
+            if (image_path.empty()) {
+                LOG_ERROR("error: metadata mode needs an image path (--image)");
+                return false;
+            }
+            if (metadata_format != "text" && metadata_format != "json") {
+                LOG_ERROR("error: invalid metadata format %s, must be one of [text, json]",
+                          metadata_format.c_str());
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool resolve_and_validate() {
+        if (!resolve()) {
+            return false;
+        }
+        if (!validate()) {
+            return false;
         }
         return true;
     }
@@ -178,15 +237,21 @@ struct SDCliParams {
         oss << "SDCliParams {\n"
             << "  mode: " << modes_str[mode] << ",\n"
             << "  output_path: \"" << output_path << "\",\n"
+            << "  image_path: \"" << image_path << "\",\n"
+            << "  metadata_format: \"" << metadata_format << "\",\n"
             << "  verbose: " << (verbose ? "true" : "false") << ",\n"
             << "  color: " << (color ? "true" : "false") << ",\n"
             << "  canny_preprocess: " << (canny_preprocess ? "true" : "false") << ",\n"
+            << "  convert_name: " << (convert_name ? "true" : "false") << ",\n"
             << "  preview_method: " << previews_str[preview_method] << ",\n"
             << "  preview_interval: " << preview_interval << ",\n"
             << "  preview_path: \"" << preview_path << "\",\n"
             << "  preview_fps: " << preview_fps << ",\n"
             << "  taesd_preview: " << (taesd_preview ? "true" : "false") << ",\n"
-            << "  preview_noisy: " << (preview_noisy ? "true" : "false") << "\n"
+            << "  preview_noisy: " << (preview_noisy ? "true" : "false") << ",\n"
+            << "  metadata_raw: " << (metadata_raw ? "true" : "false") << ",\n"
+            << "  metadata_brief: " << (metadata_brief ? "true" : "false") << ",\n"
+            << "  metadata_all: " << (metadata_all ? "true" : "false") << "\n"
             << "}";
         return oss.str();
     }
@@ -211,134 +276,33 @@ void parse_args(int argc, const char** argv, SDCliParams& cli_params, SDContextP
         exit(cli_params.normal_exit ? 0 : 1);
     }
 
-    if (!cli_params.process_and_check() ||
-        !ctx_params.process_and_check(cli_params.mode) ||
-        !gen_params.process_and_check(cli_params.mode, ctx_params.lora_model_dir)) {
+    bool valid = cli_params.resolve_and_validate();
+    if (valid && cli_params.mode != METADATA) {
+        valid = ctx_params.resolve_and_validate(cli_params.mode) &&
+                gen_params.resolve_and_validate(cli_params.mode,
+                                                ctx_params.lora_model_dir,
+                                                ctx_params.hires_upscalers_dir);
+    }
+
+    if (!valid) {
         print_usage(argc, argv, options_vec);
         exit(1);
     }
 }
 
-static std::string sd_basename(const std::string& path) {
-    size_t pos = path.find_last_of('/');
-    if (pos != std::string::npos) {
-        return path.substr(pos + 1);
-    }
-    pos = path.find_last_of('\\');
-    if (pos != std::string::npos) {
-        return path.substr(pos + 1);
-    }
-    return path;
-}
-
-std::string get_image_params(const SDCliParams& cli_params, const SDContextParams& ctx_params, const SDGenerationParams& gen_params, int64_t seed) {
-    std::string parameter_string = gen_params.prompt + "\n";
-    if (gen_params.negative_prompt.size() != 0) {
-        parameter_string += "Negative prompt: " + gen_params.negative_prompt + "\n";
-    }
-    parameter_string += "Steps: " + std::to_string(gen_params.sample_params.sample_steps) + ", ";
-    parameter_string += "CFG scale: " + std::to_string(gen_params.sample_params.guidance.txt_cfg) + ", ";
-    if (gen_params.sample_params.guidance.slg.scale != 0 && gen_params.skip_layers.size() != 0) {
-        parameter_string += "SLG scale: " + std::to_string(gen_params.sample_params.guidance.txt_cfg) + ", ";
-        parameter_string += "Skip layers: [";
-        for (const auto& layer : gen_params.skip_layers) {
-            parameter_string += std::to_string(layer) + ", ";
-        }
-        parameter_string += "], ";
-        parameter_string += "Skip layer start: " + std::to_string(gen_params.sample_params.guidance.slg.layer_start) + ", ";
-        parameter_string += "Skip layer end: " + std::to_string(gen_params.sample_params.guidance.slg.layer_end) + ", ";
-    }
-    parameter_string += "Guidance: " + std::to_string(gen_params.sample_params.guidance.distilled_guidance) + ", ";
-    parameter_string += "Eta: " + std::to_string(gen_params.sample_params.eta) + ", ";
-    parameter_string += "Seed: " + std::to_string(seed) + ", ";
-    parameter_string += "Size: " + std::to_string(gen_params.width) + "x" + std::to_string(gen_params.height) + ", ";
-    parameter_string += "Model: " + sd_basename(ctx_params.model_path) + ", ";
-    parameter_string += "RNG: " + std::string(sd_rng_type_name(ctx_params.rng_type)) + ", ";
-    if (ctx_params.sampler_rng_type != RNG_TYPE_COUNT) {
-        parameter_string += "Sampler RNG: " + std::string(sd_rng_type_name(ctx_params.sampler_rng_type)) + ", ";
-    }
-    parameter_string += "Sampler: " + std::string(sd_sample_method_name(gen_params.sample_params.sample_method));
-    if (!gen_params.custom_sigmas.empty()) {
-        parameter_string += ", Custom Sigmas: [";
-        for (size_t i = 0; i < gen_params.custom_sigmas.size(); ++i) {
-            std::ostringstream oss;
-            oss << std::fixed << std::setprecision(4) << gen_params.custom_sigmas[i];
-            parameter_string += oss.str() + (i == gen_params.custom_sigmas.size() - 1 ? "" : ", ");
-        }
-        parameter_string += "]";
-    } else if (gen_params.sample_params.scheduler != SCHEDULER_COUNT) {  // Only show schedule if not using custom sigmas
-        parameter_string += " " + std::string(sd_scheduler_name(gen_params.sample_params.scheduler));
-    }
-    parameter_string += ", ";
-    for (const auto& te : {ctx_params.clip_l_path, ctx_params.clip_g_path, ctx_params.t5xxl_path, ctx_params.llm_path, ctx_params.llm_vision_path}) {
-        if (!te.empty()) {
-            parameter_string += "TE: " + sd_basename(te) + ", ";
-        }
-    }
-    if (!ctx_params.diffusion_model_path.empty()) {
-        parameter_string += "Unet: " + sd_basename(ctx_params.diffusion_model_path) + ", ";
-    }
-    if (!ctx_params.vae_path.empty()) {
-        parameter_string += "VAE: " + sd_basename(ctx_params.vae_path) + ", ";
-    }
-    if (gen_params.clip_skip != -1) {
-        parameter_string += "Clip skip: " + std::to_string(gen_params.clip_skip) + ", ";
-    }
-    parameter_string += "Version: stable-diffusion.cpp";
-    return parameter_string;
-}
-
-/* Enables Printing the log level tag in color using ANSI escape codes */
 void sd_log_cb(enum sd_log_level_t level, const char* log, void* data) {
     SDCliParams* cli_params = (SDCliParams*)data;
-    int tag_color;
-    const char* level_str;
-    FILE* out_stream = (level == SD_LOG_ERROR) ? stderr : stdout;
-
-    if (!log || (!cli_params->verbose && level <= SD_LOG_DEBUG)) {
-        return;
-    }
-
-    switch (level) {
-        case SD_LOG_DEBUG:
-            tag_color = 37;
-            level_str = "DEBUG";
-            break;
-        case SD_LOG_INFO:
-            tag_color = 34;
-            level_str = "INFO";
-            break;
-        case SD_LOG_WARN:
-            tag_color = 35;
-            level_str = "WARN";
-            break;
-        case SD_LOG_ERROR:
-            tag_color = 31;
-            level_str = "ERROR";
-            break;
-        default: /* Potential future-proofing */
-            tag_color = 33;
-            level_str = "?????";
-            break;
-    }
-
-    if (cli_params->color == true) {
-        fprintf(out_stream, "\033[%d;1m[%-5s]\033[0m ", tag_color, level_str);
-    } else {
-        fprintf(out_stream, "[%-5s] ", level_str);
-    }
-    fputs(log, out_stream);
-    fflush(out_stream);
+    log_print(level, log, cli_params->verbose, cli_params->color);
 }
 
 bool load_images_from_dir(const std::string dir,
-                          std::vector<sd_image_t>& images,
+                          std::vector<SDImageOwner>& images,
                           int expected_width  = 0,
                           int expected_height = 0,
                           int max_image_num   = 0,
                           bool verbose        = false) {
     if (!fs::exists(dir) || !fs::is_directory(dir)) {
-        fprintf(stderr, "'%s' is not a valid directory\n", dir.c_str());
+        LOG_ERROR("'%s' is not a valid directory\n", dir.c_str());
         return false;
     }
 
@@ -359,24 +323,22 @@ bool load_images_from_dir(const std::string dir,
         std::string ext  = entry.path().extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
-        if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp") {
-            if (verbose) {
-                printf("load image %zu from '%s'\n", images.size(), path.c_str());
-            }
+        if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" || ext == ".webp") {
+            LOG_DEBUG("load image %zu from '%s'", images.size(), path.c_str());
             int width             = 0;
             int height            = 0;
             uint8_t* image_buffer = load_image_from_file(path.c_str(), width, height, expected_width, expected_height);
             if (image_buffer == nullptr) {
-                fprintf(stderr, "load image from '%s' failed\n", path.c_str());
+                LOG_ERROR("load image from '%s' failed", path.c_str());
                 return false;
             }
 
-            images.push_back({(uint32_t)width,
-                              (uint32_t)height,
-                              3,
-                              image_buffer});
+            images.emplace_back(sd_image_t{(uint32_t)width,
+                                           (uint32_t)height,
+                                           3,
+                                           image_buffer});
 
-            if (max_image_num > 0 && images.size() >= max_image_num) {
+            if (max_image_num > 0 && static_cast<int>(images.size()) >= max_image_num) {
                 break;
             }
         }
@@ -391,10 +353,190 @@ void step_callback(int step, int frame_count, sd_image_t* image, bool is_noisy, 
     // is_noisy is set to true if the preview corresponds to noisy latents, false if it's denoised latents
     // unused in this app, it will either be always noisy or always denoised here
     if (frame_count == 1) {
-        stbi_write_png(cli_params->preview_path.c_str(), image->width, image->height, image->channel, image->data, 0);
+        if (!write_image_to_file(cli_params->preview_path,
+                                 image->data,
+                                 image->width,
+                                 image->height,
+                                 image->channel)) {
+            LOG_ERROR("save preview image to '%s' failed", cli_params->preview_path.c_str());
+        }
     } else {
-        create_mjpg_avi_from_sd_images(cli_params->preview_path.c_str(), image, frame_count, cli_params->preview_fps);
+        if (create_video_from_sd_images(cli_params->preview_path.c_str(), image, frame_count, cli_params->preview_fps) != 0) {
+            LOG_ERROR("save preview video to '%s' failed", cli_params->preview_path.c_str());
+        }
     }
+}
+
+std::string format_frame_idx(std::string pattern, int frame_idx) {
+    std::smatch match;
+    std::string result = pattern;
+    while (std::regex_search(result, match, format_specifier_regex)) {
+        std::string specifier = match.str(1);
+        char buffer[32];
+        snprintf(buffer, sizeof(buffer), specifier.c_str(), frame_idx);
+        result.replace(match.position(1), match.length(1), buffer);
+    }
+
+    // Then replace all '%%' with '%'
+    size_t pos = 0;
+    while ((pos = result.find("%%", pos)) != std::string::npos) {
+        result.replace(pos, 2, "%");
+        pos += 1;
+    }
+    return result;
+}
+
+static fs::path get_video_audio_sidecar_path(const SDCliParams& cli_params) {
+    fs::path out_path     = cli_params.output_path;
+    fs::path base_path    = out_path;
+    fs::path ext          = out_path.has_extension() ? out_path.extension() : fs::path{};
+    std::string ext_lower = ext.string();
+    std::transform(ext_lower.begin(), ext_lower.end(), ext_lower.begin(), ::tolower);
+    const EncodedImageFormat output_format = encoded_image_format_from_path(out_path.string());
+    if (!ext.empty()) {
+        if (output_format == EncodedImageFormat::JPEG ||
+            output_format == EncodedImageFormat::PNG ||
+            output_format == EncodedImageFormat::WEBP ||
+            ext_lower == ".avi" ||
+            ext_lower == ".webm") {
+            base_path.replace_extension();
+        }
+    }
+    base_path += ".wav";
+    return base_path;
+}
+
+bool save_results(const SDCliParams& cli_params,
+                  const SDContextParams& ctx_params,
+                  const SDGenerationParams& gen_params,
+                  sd_image_t* results,
+                  int num_results,
+                  const sd_audio_t* generated_audio = nullptr) {
+    if (results == nullptr || num_results <= 0) {
+        return false;
+    }
+
+    namespace fs      = std::filesystem;
+    fs::path out_path = cli_params.output_path;
+
+    if (!out_path.parent_path().empty()) {
+        std::error_code ec;
+        fs::create_directories(out_path.parent_path(), ec);
+        if (ec) {
+            LOG_ERROR("failed to create directory '%s': %s",
+                      out_path.parent_path().string().c_str(), ec.message().c_str());
+            return false;
+        }
+    }
+
+    fs::path base_path = out_path;
+    fs::path ext       = out_path.has_extension() ? out_path.extension() : fs::path{};
+
+    std::string ext_lower = ext.string();
+    std::transform(ext_lower.begin(), ext_lower.end(), ext_lower.begin(), ::tolower);
+    const EncodedImageFormat output_format = encoded_image_format_from_path(out_path.string());
+    if (!ext.empty()) {
+        if (output_format == EncodedImageFormat::JPEG ||
+            output_format == EncodedImageFormat::PNG ||
+            output_format == EncodedImageFormat::WEBP ||
+            ext_lower == ".avi" ||
+            ext_lower == ".webm") {
+            base_path.replace_extension();
+        }
+    }
+
+    int output_begin_idx = cli_params.output_begin_idx;
+    if (output_begin_idx < 0) {
+        output_begin_idx = 0;
+    }
+
+    auto write_image = [&](const fs::path& path, int idx) {
+        const sd_image_t& img = results[idx];
+        if (!img.data)
+            return false;
+
+        const int64_t metadata_seed = cli_params.mode == VID_GEN ? gen_params.seed : gen_params.seed + idx;
+        std::string params          = gen_params.embed_image_metadata
+                                          ? get_image_params(ctx_params, gen_params, metadata_seed, cli_params.mode)
+                                          : "";
+        const bool ok               = write_image_to_file(path.string(), img.data, img.width, img.height, img.channel, params, 90);
+        LOG_INFO("save result image %d to '%s' (%s)", idx, path.string().c_str(), ok ? "success" : "failure");
+        return ok;
+    };
+
+    auto write_audio_sidecar = [&](const fs::path& wav_path) {
+        if (generated_audio == nullptr) {
+            return;
+        }
+        if (write_wav_to_file(wav_path.string(),
+                              generated_audio->data,
+                              generated_audio->sample_count,
+                              generated_audio->channels,
+                              generated_audio->sample_rate)) {
+            LOG_INFO("save result audio to '%s'", wav_path.string().c_str());
+        } else {
+            LOG_WARN("failed to save result audio to '%s'", wav_path.string().c_str());
+        }
+    };
+
+    int sucessful_reults = 0;
+
+    if (std::regex_search(cli_params.output_path, format_specifier_regex)) {
+        if (output_format == EncodedImageFormat::UNKNOWN)
+            ext = ".png";
+        fs::path pattern = base_path;
+        pattern += ext;
+
+        for (int i = 0; i < num_results; ++i) {
+            fs::path img_path = format_frame_idx(pattern.string(), output_begin_idx + i);
+            if (write_image(img_path, i)) {
+                sucessful_reults++;
+            }
+        }
+        LOG_INFO("%d/%d images saved", sucessful_reults, num_results);
+        return sucessful_reults != 0;
+    }
+
+    if (cli_params.mode == VID_GEN && num_results > 1) {
+        if (ext_lower != ".avi" && ext_lower != ".webp" && ext_lower != ".webm")
+            ext = ".avi";
+        fs::path video_path = base_path;
+        video_path += ext;
+        std::string final_ext_lower = ext.string();
+        std::transform(final_ext_lower.begin(), final_ext_lower.end(), final_ext_lower.begin(), ::tolower);
+        const bool mux_audio = generated_audio != nullptr && (final_ext_lower == ".avi" || final_ext_lower == ".webm");
+        if (create_video_from_sd_images(video_path.string().c_str(), results, num_results, gen_params.fps, 90, mux_audio ? generated_audio : nullptr) == 0) {
+            LOG_INFO("save result video to '%s'", video_path.string().c_str());
+            if (generated_audio != nullptr && !mux_audio) {
+                fs::path wav_path = video_path;
+                wav_path.replace_extension(".wav");
+                write_audio_sidecar(wav_path);
+            }
+            return true;
+        } else {
+            LOG_ERROR("Failed to save result video to '%s'", video_path.string().c_str());
+            return false;
+        }
+    }
+
+    if (output_format == EncodedImageFormat::UNKNOWN)
+        ext = ".png";
+
+    for (int i = 0; i < num_results; ++i) {
+        fs::path img_path = base_path;
+        if (num_results > 1) {
+            img_path += "_" + std::to_string(output_begin_idx + i);
+        }
+        img_path += ext;
+        if (write_image(img_path, i)) {
+            sucessful_reults++;
+        }
+    }
+    LOG_INFO("%d/%d images saved", sucessful_reults, num_results);
+    if (generated_audio != nullptr) {
+        write_audio_sidecar(get_video_audio_sidecar_path(cli_params));
+    }
+    return sucessful_reults != 0;
 }
 
 
@@ -433,9 +575,29 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
     SDGenerationParams gen_params;
 
     parse_args(argc, argv, cli_params, ctx_params, gen_params);
-    if (cli_params.verbose || cli_params.version) {
-        std::cout << version_string() << "\n";
+    if(use_log_callback) {
+        sd_set_log_callback(sd_log_cb, (void*)&cli_params);
     }
+    log_verbose = cli_params.verbose;
+    log_color   = cli_params.color;
+
+    if (cli_params.mode == METADATA) {
+        MetadataReadOptions options;
+        options.output_format      = cli_params.metadata_format == "json"
+                                         ? MetadataOutputFormat::JSON
+                                         : MetadataOutputFormat::TEXT;
+        options.include_raw        = cli_params.metadata_raw;
+        options.brief              = cli_params.metadata_brief;
+        options.include_structural = cli_params.metadata_all;
+
+        std::string error;
+        if (!print_image_metadata(cli_params.image_path, options, std::cout, error)) {
+            LOG_ERROR("%s", error.c_str());
+            return 1;
+        }
+        return 0;
+    }
+
     if (gen_params.video_frames > 4) {
         size_t last_dot_pos   = cli_params.preview_path.find_last_of(".");
         std::string base_path = cli_params.preview_path;
@@ -453,9 +615,6 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
     if (cli_params.preview_method == PREVIEW_PROJ)
         cli_params.preview_fps /= 4;
 
-    if(use_log_callback) {
-        sd_set_log_callback(sd_log_cb, (void*)&cli_params);
-    }
     sd_set_preview_callback(step_callback,
                             cli_params.preview_method,
                             cli_params.preview_interval,
@@ -463,161 +622,119 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
                             cli_params.preview_noisy,
                             (void*)&cli_params);
 
-    if (cli_params.verbose) {
-        printf("%s", sd_get_system_info());
-        printf("%s\n", cli_params.to_string().c_str());
-        printf("%s\n", ctx_params.to_string().c_str());
-        printf("%s\n", gen_params.to_string().c_str());
-    }
+    LOG_DEBUG("version: %s", version_string().c_str());
+    LOG_DEBUG("%s", sd_get_system_info());
+    LOG_DEBUG("%s", cli_params.to_string().c_str());
+    LOG_DEBUG("%s", ctx_params.to_string().c_str());
+    LOG_DEBUG("%s", gen_params.to_string().c_str());
 
     if (cli_params.mode == CONVERT) {
         bool success = convert(ctx_params.model_path.c_str(),
                                ctx_params.vae_path.c_str(),
                                cli_params.output_path.c_str(),
                                ctx_params.wtype,
-                               ctx_params.tensor_type_rules.c_str());
+                               ctx_params.tensor_type_rules.c_str(),
+                               cli_params.convert_name);
         if (!success) {
-            fprintf(stderr,
-                    "convert '%s'/'%s' to '%s' failed\n",
-                    ctx_params.model_path.c_str(),
-                    ctx_params.vae_path.c_str(),
-                    cli_params.output_path.c_str());
+            LOG_ERROR("convert '%s'/'%s' to '%s' failed",
+                      ctx_params.model_path.c_str(),
+                      ctx_params.vae_path.c_str(),
+                      cli_params.output_path.c_str());
             return 1;
         } else {
-            printf("convert '%s'/'%s' to '%s' success\n",
-                   ctx_params.model_path.c_str(),
-                   ctx_params.vae_path.c_str(),
-                   cli_params.output_path.c_str());
+            LOG_INFO("convert '%s'/'%s' to '%s' success",
+                     ctx_params.model_path.c_str(),
+                     ctx_params.vae_path.c_str(),
+                     cli_params.output_path.c_str());
             return 0;
         }
     }
 
-    bool vae_decode_only     = true;
-    sd_image_t init_image    = {(uint32_t)gen_params.width, (uint32_t)gen_params.height, 3, nullptr};
-    sd_image_t end_image     = {(uint32_t)gen_params.width, (uint32_t)gen_params.height, 3, nullptr};
-    sd_image_t control_image = {(uint32_t)gen_params.width, (uint32_t)gen_params.height, 3, nullptr};
-    sd_image_t mask_image    = {(uint32_t)gen_params.width, (uint32_t)gen_params.height, 1, nullptr};
-    std::vector<sd_image_t> ref_images;
-    std::vector<sd_image_t> pmid_images;
-    std::vector<sd_image_t> control_frames;
+    bool vae_decode_only = true;
 
-    auto release_all_resources = [&]() {
-        free(init_image.data);
-        free(end_image.data);
-        free(control_image.data);
-        free(mask_image.data);
-        for (auto image : ref_images) {
-            free(image.data);
-            image.data = nullptr;
+    auto load_image_and_update_size = [&](const std::string& path,
+                                          SDImageOwner& image,
+                                          bool resize_image    = true,
+                                          int expected_channel = 3) -> bool {
+        int expected_width  = 0;
+        int expected_height = 0;
+        if (resize_image && gen_params.width_and_height_are_set()) {
+            expected_width  = gen_params.width;
+            expected_height = gen_params.height;
         }
-        ref_images.clear();
-        for (auto image : pmid_images) {
-            free(image.data);
-            image.data = nullptr;
+
+        if (!load_sd_image_from_file(image.put(), path.c_str(), expected_width, expected_height, expected_channel)) {
+            LOG_ERROR("load image from '%s' failed", path.c_str());
+            return false;
         }
-        pmid_images.clear();
-        for (auto image : control_frames) {
-            free(image.data);
-            image.data = nullptr;
-        }
-        control_frames.clear();
+
+        gen_params.set_width_and_height_if_unset(image.get().width, image.get().height);
+        return true;
     };
 
     if (gen_params.init_image_path.size() > 0) {
         vae_decode_only = false;
-
-        int width       = 0;
-        int height      = 0;
-        init_image.data = load_image_from_file(gen_params.init_image_path.c_str(), width, height, gen_params.width, gen_params.height);
-        if (init_image.data == nullptr) {
-            fprintf(stderr, "load image from '%s' failed\n", gen_params.init_image_path.c_str());
-            release_all_resources();
+        if (!load_image_and_update_size(gen_params.init_image_path, gen_params.init_image)) {
             return 1;
         }
     }
+
     if (!with_init_images.empty()) {
         vae_decode_only = false;
         auto& init_image_data = with_init_images[0];
         int img_width           = init_image_data.width;
         int img_height           = init_image_data.height;
         int img_length = init_image_data.data_len;
+        sd_image_t init_image    = {static_cast<uint32_t>(gen_params.width), static_cast<uint32_t>(gen_params.height), 3, nullptr};
         init_image.data = load_image_from_memory((const char *)init_image_data.data, img_length, img_width, img_height);
         if (init_image.data == nullptr) {
-            fprintf(stderr, "load init image failed\n");
-            release_all_resources();
+            LOG_ERROR("load init image failed");
             return 1;
         }
+        gen_params.init_image = SDImageOwner(init_image);
     }
 
     if (gen_params.end_image_path.size() > 0) {
         vae_decode_only = false;
-
-        int width      = 0;
-        int height     = 0;
-        end_image.data = load_image_from_file(gen_params.end_image_path.c_str(), width, height, gen_params.width, gen_params.height);
-        if (end_image.data == nullptr) {
-            fprintf(stderr, "load image from '%s' failed\n", gen_params.end_image_path.c_str());
-            release_all_resources();
+        if (!load_image_and_update_size(gen_params.end_image_path, gen_params.end_image)) {
             return 1;
-        }
-    }
-
-    if (gen_params.mask_image_path.size() > 0) {
-        int c           = 0;
-        int width       = 0;
-        int height      = 0;
-        mask_image.data = load_image_from_file(gen_params.mask_image_path.c_str(), width, height, gen_params.width, gen_params.height, 1);
-        if (mask_image.data == nullptr) {
-            fprintf(stderr, "load image from '%s' failed\n", gen_params.mask_image_path.c_str());
-            release_all_resources();
-            return 1;
-        }
-    } else {
-        mask_image.data = (uint8_t*)malloc(gen_params.width * gen_params.height);
-        memset(mask_image.data, 255, gen_params.width * gen_params.height);
-        if (mask_image.data == nullptr) {
-            fprintf(stderr, "malloc mask image failed\n");
-            release_all_resources();
-            return 1;
-        }
-    }
-
-    if (gen_params.control_image_path.size() > 0) {
-        int width          = 0;
-        int height         = 0;
-        control_image.data = load_image_from_file(gen_params.control_image_path.c_str(), width, height, gen_params.width, gen_params.height);
-        if (control_image.data == nullptr) {
-            fprintf(stderr, "load image from '%s' failed\n", gen_params.control_image_path.c_str());
-            release_all_resources();
-            return 1;
-        }
-        if (cli_params.canny_preprocess) {  // apply preprocessor
-            preprocess_canny(control_image,
-                             0.08f,
-                             0.08f,
-                             0.8f,
-                             1.0f,
-                             false);
         }
     }
 
     if (gen_params.ref_image_paths.size() > 0) {
         vae_decode_only = false;
+        gen_params.ref_images.clear();
         for (auto& path : gen_params.ref_image_paths) {
-            int width             = 0;
-            int height            = 0;
-            uint8_t* image_buffer = load_image_from_file(path.c_str(), width, height);
-            if (image_buffer == nullptr) {
-                fprintf(stderr, "load image from '%s' failed\n", path.c_str());
-                release_all_resources();
+            SDImageOwner ref_image({0, 0, 3, nullptr});
+            if (!load_image_and_update_size(path, ref_image, false)) {
                 return 1;
             }
-            ref_images.push_back({(uint32_t)width,
-                                  (uint32_t)height,
-                                  3,
-                                  image_buffer});
+            gen_params.ref_images.push_back(std::move(ref_image));
         }
     }
+
+    if (gen_params.mask_image_path.size() > 0) {
+        if (!load_sd_image_from_file(gen_params.mask_image.put(),
+                                     gen_params.mask_image_path.c_str(),
+                                     gen_params.get_resolved_width(),
+                                     gen_params.get_resolved_height(),
+                                     1)) {
+            LOG_ERROR("load image from '%s' failed", gen_params.mask_image_path.c_str());
+            return 1;
+        }
+    } else {
+        sd_image_t generated_mask = {0, 0, 1, nullptr};
+        generated_mask.data       = (uint8_t*)malloc(gen_params.get_resolved_width() * gen_params.get_resolved_height());
+        if (generated_mask.data == nullptr) {
+            LOG_ERROR("malloc mask image failed");
+            return 1;
+        }
+        generated_mask.width  = gen_params.get_resolved_width();
+        generated_mask.height = gen_params.get_resolved_height();
+        memset(generated_mask.data, 255, gen_params.get_resolved_width() * gen_params.get_resolved_height());
+        gen_params.mask_image.reset(generated_mask);
+    }
+
     if (!with_ref_images.empty()) {
         vae_decode_only = false;
         for (auto& ref_image : with_ref_images) {
@@ -628,30 +745,54 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
             if (!raw_pixels) {
                 continue;
             }
-            ref_images.push_back({(uint32_t)img_width, (uint32_t)img_height, 3, (uint8_t*)raw_pixels});
+            sd_image_t sd_image    = {static_cast<uint32_t>(gen_params.width), static_cast<uint32_t>(gen_params.height), 3, nullptr};
+            sd_image.data = load_image_from_memory((const char *)sd_image.data, img_length, img_width, img_height);
+            if (sd_image.data == nullptr) {
+                LOG_ERROR("load image from '%s' failed", gen_params.mask_image_path.c_str());
+                return 1;
+            }
+            gen_params.ref_images.emplace_back(sd_image);
+        }
+    }
+
+    if (gen_params.control_image_path.size() > 0) {
+        if (!load_sd_image_from_file(gen_params.control_image.put(),
+                                     gen_params.control_image_path.c_str(),
+                                     gen_params.get_resolved_width(),
+                                     gen_params.get_resolved_height())) {
+            LOG_ERROR("load image from '%s' failed", gen_params.control_image_path.c_str());
+            return 1;
+        }
+        if (cli_params.canny_preprocess) {  // apply preprocessor
+            preprocess_canny(gen_params.control_image.get(),
+                             0.08f,
+                             0.08f,
+                             0.8f,
+                             1.0f,
+                             false);
         }
     }
 
     if (!gen_params.control_video_path.empty()) {
+        gen_params.control_frames.clear();
         if (!load_images_from_dir(gen_params.control_video_path,
-                                  control_frames,
-                                  gen_params.width,
-                                  gen_params.height,
+                                  gen_params.control_frames,
+                                  gen_params.get_resolved_width(),
+                                  gen_params.get_resolved_height(),
                                   gen_params.video_frames,
                                   cli_params.verbose)) {
-            release_all_resources();
             return 1;
         }
     }
 
     if (!gen_params.pm_id_images_dir.empty()) {
+        gen_params.pm_id_images.clear();
         if (!load_images_from_dir(gen_params.pm_id_images_dir,
-                                  pmid_images,
+                                  gen_params.pm_id_images,
                                   0,
                                   0,
                                   0,
                                   cli_params.verbose)) {
-            release_all_resources();
             return 1;
         }
     }
@@ -660,247 +801,132 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
         vae_decode_only = false;
     }
 
+    if (gen_params.hires_enabled &&
+        (gen_params.resolved_hires_upscaler == SD_HIRES_UPSCALER_MODEL ||
+         gen_params.resolved_hires_upscaler == SD_HIRES_UPSCALER_LANCZOS ||
+         gen_params.resolved_hires_upscaler == SD_HIRES_UPSCALER_NEAREST)) {
+        vae_decode_only = false;
+    }
+
     sd_ctx_params_t sd_ctx_params = ctx_params.to_sd_ctx_params_t(vae_decode_only, true, cli_params.taesd_preview);
 
-    sd_image_t* results = nullptr;
-    int num_results     = 0;
+    SDImageVec results;
+    int num_results             = 0;
+    sd_audio_t* generated_audio = nullptr;
 
     if (cli_params.mode == UPSCALE) {
         num_results = 1;
-        results     = (sd_image_t*)calloc(num_results, sizeof(sd_image_t));
-        if (results == nullptr) {
-            printf("failed to allocate results array\n");
-            release_all_resources();
-            return 1;
-        }
-
-        results[0]      = init_image;
-        init_image.data = nullptr;
+        results.push_back(gen_params.init_image.release());
     } else {
-        sd_ctx_t* sd_ctx = new_sd_ctx(&sd_ctx_params);
+        SDCtxPtr sd_ctx(new_sd_ctx(&sd_ctx_params));
 
         if (sd_ctx == nullptr) {
-            printf("new_sd_ctx_t failed\n");
-            release_all_resources();
+            LOG_INFO("new_sd_ctx_t failed");
             return 1;
         }
 
         if (gen_params.sample_params.sample_method == SAMPLE_METHOD_COUNT) {
-            gen_params.sample_params.sample_method = sd_get_default_sample_method(sd_ctx);
+            gen_params.sample_params.sample_method = sd_get_default_sample_method(sd_ctx.get());
         }
 
         if (gen_params.high_noise_sample_params.sample_method == SAMPLE_METHOD_COUNT) {
-            gen_params.high_noise_sample_params.sample_method = sd_get_default_sample_method(sd_ctx);
+            gen_params.high_noise_sample_params.sample_method = sd_get_default_sample_method(sd_ctx.get());
         }
 
         if (gen_params.sample_params.scheduler == SCHEDULER_COUNT) {
-            gen_params.sample_params.scheduler = sd_get_default_scheduler(sd_ctx);
+            gen_params.sample_params.scheduler = sd_get_default_scheduler(sd_ctx.get(), gen_params.sample_params.sample_method);
         }
 
         if (cli_params.mode == IMG_GEN) {
-            sd_img_gen_params_t img_gen_params = {
-                gen_params.lora_vec.data(),
-                static_cast<uint32_t>(gen_params.lora_vec.size()),
-                gen_params.prompt.c_str(),
-                gen_params.negative_prompt.c_str(),
-                gen_params.clip_skip,
-                init_image,
-                ref_images.data(),
-                (int)ref_images.size(),
-                gen_params.auto_resize_ref_image,
-                gen_params.increase_ref_index,
-                mask_image,
-                gen_params.width,
-                gen_params.height,
-                gen_params.sample_params,
-                gen_params.strength,
-                gen_params.seed,
-                gen_params.batch_count,
-                control_image,
-                gen_params.control_strength,
-                {
-                    pmid_images.data(),
-                    (int)pmid_images.size(),
-                    gen_params.pm_id_embed_path.c_str(),
-                    gen_params.pm_style_strength,
-                },  // pm_params
-                ctx_params.vae_tiling_params,
-                gen_params.easycache_params,
-            };
+            sd_img_gen_params_t img_gen_params = gen_params.to_sd_img_gen_params_t();
 
-            results     = generate_image(sd_ctx, &img_gen_params);
             num_results = gen_params.batch_count;
+            results.adopt(generate_image(sd_ctx.get(), &img_gen_params), num_results);
         } else if (cli_params.mode == VID_GEN) {
-            sd_vid_gen_params_t vid_gen_params = {
-                gen_params.lora_vec.data(),
-                static_cast<uint32_t>(gen_params.lora_vec.size()),
-                gen_params.prompt.c_str(),
-                gen_params.negative_prompt.c_str(),
-                gen_params.clip_skip,
-                init_image,
-                end_image,
-                control_frames.data(),
-                (int)control_frames.size(),
-                gen_params.width,
-                gen_params.height,
-                gen_params.sample_params,
-                gen_params.high_noise_sample_params,
-                gen_params.moe_boundary,
-                gen_params.strength,
-                gen_params.seed,
-                gen_params.video_frames,
-                gen_params.vace_strength,
-                gen_params.easycache_params,
-            };
-
-            results = generate_video(sd_ctx, &vid_gen_params, &num_results);
+            sd_vid_gen_params_t vid_gen_params = gen_params.to_sd_vid_gen_params_t();
+            sd_image_t* generated_video        = nullptr;
+            if (!generate_video(sd_ctx.get(), &vid_gen_params, &generated_video, &num_results, &generated_audio)) {
+                generated_video = nullptr;
+            }
+            results.adopt(generated_video, num_results);
         }
 
-        if (results == nullptr) {
-            printf("generate failed\n");
-            free_sd_ctx(sd_ctx);
+        if (!results) {
+            LOG_ERROR("generate failed");
             return 1;
         }
-
-        free_sd_ctx(sd_ctx);
     }
 
     int upscale_factor = 4;  // unused for RealESRGAN_x4plus_anime_6B.pth
     if (ctx_params.esrgan_path.size() > 0 && gen_params.upscale_repeats > 0) {
-        upscaler_ctx_t* upscaler_ctx = new_upscaler_ctx(ctx_params.esrgan_path.c_str(),
-                                                        ctx_params.offload_params_to_cpu,
-                                                        ctx_params.diffusion_conv_direct,
-                                                        ctx_params.n_threads,
-                                                        gen_params.upscale_tile_size);
+        UpscalerCtxPtr upscaler_ctx(new_upscaler_ctx(ctx_params.esrgan_path.c_str(),
+                                                     ctx_params.offload_params_to_cpu,
+                                                     ctx_params.diffusion_conv_direct,
+                                                     ctx_params.n_threads,
+                                                     gen_params.upscale_tile_size,
+                                                     ctx_params.backend.c_str(),
+                                                     ctx_params.params_backend.c_str()));
 
         if (upscaler_ctx == nullptr) {
-            printf("new_upscaler_ctx failed\n");
+            LOG_ERROR("new_upscaler_ctx failed");
         } else {
             for (int i = 0; i < num_results; i++) {
                 if (results[i].data == nullptr) {
                     continue;
                 }
-                sd_image_t current_image = results[i];
+                SDImageOwner current_image(results[i]);
+                results[i] = {0, 0, 0, nullptr};
                 for (int u = 0; u < gen_params.upscale_repeats; ++u) {
-                    sd_image_t upscaled_image = upscale(upscaler_ctx, current_image, upscale_factor);
-                    if (upscaled_image.data == nullptr) {
-                        printf("upscale failed\n");
+                    SDImageOwner upscaled_image(upscale(upscaler_ctx.get(), current_image.get(), upscale_factor));
+                    if (upscaled_image.get().data == nullptr) {
+                        LOG_ERROR("upscale failed");
                         break;
                     }
-                    free(current_image.data);
-                    current_image = upscaled_image;
+                    current_image = std::move(upscaled_image);
                 }
-                results[i] = current_image;  // Set the final upscaled image as the result
+                results[i] = current_image.release();  // Set the final upscaled image as the result
             }
         }
     }
 
-    // create directory if not exists
-    {
-        const fs::path out_path = cli_params.output_path;
-        if (const fs::path out_dir = out_path.parent_path(); !out_dir.empty()) {
-            std::error_code ec;
-            fs::create_directories(out_dir, ec);  // OK if already exists
-            if (ec) {
-                fprintf(stderr, "failed to create directory '%s': %s\n",
-                        out_dir.string().c_str(), ec.message().c_str());
-                return 1;
-            }
+    if (write_file) {
+        if (!save_results(cli_params, ctx_params, gen_params, results.data(), num_results, generated_audio)) {
+            free_sd_audio(generated_audio);
+            return 1;
         }
-    }
+        free_sd_audio(generated_audio);
+        return 0;
+    } else if (cli_params.mode == VID_GEN && num_results > 1) {
+        const std::string format = "webm";
+        constexpr int quality = 90;
+        const bool mux_audio = generated_audio != nullptr;
 
-    std::string base_path;
-    std::string file_ext;
-    std::string file_ext_lower;
-    bool is_jpg;
-    size_t last_dot_pos   = cli_params.output_path.find_last_of(".");
-    size_t last_slash_pos = std::min(cli_params.output_path.find_last_of("/"),
-                                     cli_params.output_path.find_last_of("\\"));
-    if (last_dot_pos != std::string::npos && (last_slash_pos == std::string::npos || last_dot_pos > last_slash_pos)) {  // filename has extension
-        base_path = cli_params.output_path.substr(0, last_dot_pos);
-        file_ext = file_ext_lower = cli_params.output_path.substr(last_dot_pos);
-        std::transform(file_ext.begin(), file_ext.end(), file_ext_lower.begin(), ::tolower);
-        is_jpg = (file_ext_lower == ".jpg" || file_ext_lower == ".jpeg" || file_ext_lower == ".jpe");
+        std::vector<uint8_t> video_data = create_video_from_sd_images_to_vector(format, results.data(), num_results, gen_params.fps, quality, mux_audio ? generated_audio : nullptr);
+        auto *image_data = new ImageData();
+        image_data->image_data = video_data;
+        image_output->images.push_back(image_data);
     } else {
-        base_path = cli_params.output_path;
-        file_ext = file_ext_lower = "";
-        is_jpg                    = false;
-    }
-
-    if (cli_params.mode == VID_GEN && num_results > 1) {
-        std::string vid_output_path = cli_params.output_path;
-        if (file_ext_lower == ".png") {
-            vid_output_path = base_path + ".avi";
-        }
-        if (write_file) {
-            create_mjpg_avi_from_sd_images(vid_output_path.c_str(), results, num_results, gen_params.fps);
-            printf("save result MJPG AVI video to '%s'\n", vid_output_path.c_str());
-        } else {
-            for (int i = 0; i < num_results; i++) {
-                if (results[i].data == nullptr) {
-                    continue;
-                }
-                auto image_params = get_image_params(cli_params, ctx_params, gen_params, gen_params.seed + i);
-                int len;
-                //require png output right now.
-                unsigned char *png = stbi_write_png_to_mem((const unsigned char *) results[i].data, 0, results[i].width, results[i].height, results[i].channel, &len, image_params.c_str());
-                if (png == NULL) {
-                    auto *image_data = new ImageData();
-                    image_output->images.push_back(image_data);
-                } else {
-                    auto *image_data = new ImageData();
-                    image_data->image_data.assign(png, png + len);
-                    image_output->images.push_back(image_data);
-                }
-            }
-        }
-    } else {
-        // appending ".png" to absent or unknown extension
-        if (!is_jpg && file_ext_lower != ".png") {
-            base_path += file_ext;
-            file_ext = ".png";
-        }
         for (int i = 0; i < num_results; i++) {
-            if (results[i].data == nullptr) {
-                continue;
-            }
-            int write_ok;
-            std::string final_image_path = i > 0 ? base_path + "_" + std::to_string(i + 1) + file_ext : base_path + file_ext;
-            if(write_file) {
-                if (is_jpg) {
-                    write_ok = stbi_write_jpg(final_image_path.c_str(), results[i].width, results[i].height, results[i].channel,
-                                              results[i].data, 90, get_image_params(cli_params, ctx_params, gen_params, gen_params.seed + i).c_str());
-                    printf("save result JPEG image to '%s' (%s)\n", final_image_path.c_str(), write_ok == 0 ? "failure" : "success");
-                } else {
-                    write_ok = stbi_write_png(final_image_path.c_str(), results[i].width, results[i].height, results[i].channel,
-                                              results[i].data, 0, get_image_params(cli_params, ctx_params, gen_params, gen_params.seed + i).c_str());
-                    printf("save result PNG image to '%s' (%s)\n", final_image_path.c_str(), write_ok == 0 ? "failure" : "success");
-                }
-            } else {
-                auto image_params = get_image_params(cli_params, ctx_params, gen_params, gen_params.seed + i);
-                int len;
-                //Only PNG output right now.
-                unsigned char *png = stbi_write_png_to_mem((const unsigned char *) results[i].data, 0, results[i].width, results[i].height, results[i].channel, &len, image_params.c_str());
-                if (png == NULL) {
-                    auto *image_data = new ImageData();
-                    image_output->images.push_back(image_data);
-                } else {
-                    auto *image_data = new ImageData();
-                    image_data->image_data.assign(png, png + len);
-                    image_output->images.push_back(image_data);
-                }
+            if (results[i].data != nullptr) {
+                const int64_t metadata_seed = cli_params.mode == VID_GEN ? gen_params.seed : gen_params.seed + i;
+                std::string params          = gen_params.embed_image_metadata
+                                                  ? get_image_params(ctx_params, gen_params, metadata_seed, cli_params.mode)
+                                                  : "";
+                const EncodedImageFormat output_format = EncodedImageFormat::PNG;
+                constexpr int quality = 90;
+                const std::vector<uint8_t> encoded_data = encode_image_to_vector(output_format,
+                    results[i].data,
+                    results[i].width,
+                    results[i].height,
+                    results[i].channel, params, quality);
+                auto *image_data = new ImageData();
+                image_data->image_data = encoded_data;
+                image_output->images.push_back(image_data);
             }
         }
     }
 
-    for (int i = 0; i < num_results; i++) {
-        free(results[i].data);
-        results[i].data = nullptr;
-    }
-    free(results);
-
-    release_all_resources();
-
+    free_sd_audio(generated_audio);
     return 0;
 }
 
