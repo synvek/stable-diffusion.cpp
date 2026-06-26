@@ -256,7 +256,7 @@ bool parse_options(int argc, const char** argv, const std::vector<ArgOptions>& o
                         invalid_arg = true;
                         return;
                     }
-                    *option.target = argv_to_utf8(i, argv);
+                    *option.target = std::string(argv[i]);
                     found_arg      = true;
                 }))
                 break;

@@ -685,13 +685,20 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
         int img_width           = init_image_data.width;
         int img_height           = init_image_data.height;
         int img_length = init_image_data.data_len;
-        sd_image_t init_image    = {static_cast<uint32_t>(gen_params.width), static_cast<uint32_t>(gen_params.height), 3, nullptr};
-        init_image.data = load_image_from_memory((const char *)init_image_data.data, img_length, img_width, img_height);
-        if (init_image.data == nullptr) {
+        
+        // Determine target dimensions (use gen_params if set, otherwise use source dimensions)
+        int target_width  = gen_params.width_and_height_are_set() ? gen_params.width : img_width;
+        int target_height = gen_params.width_and_height_are_set() ? gen_params.height : img_height;
+        
+        uint8_t* image_data = load_image_from_memory((const char *)init_image_data.data, img_length, target_width, target_height);
+        if (image_data == nullptr) {
             LOG_ERROR("load init image failed");
             return 1;
         }
+        
+        sd_image_t init_image = {static_cast<uint32_t>(target_width), static_cast<uint32_t>(target_height), 3, image_data};
         gen_params.init_image = SDImageOwner(init_image);
+        gen_params.set_width_and_height_if_unset(target_width, target_height);
     }
 
     if (gen_params.end_image_path.size() > 0) {
@@ -699,6 +706,28 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
         if (!load_image_and_update_size(gen_params.end_image_path, gen_params.end_image)) {
             return 1;
         }
+    }
+
+    if (!with_end_images.empty()) {
+        vae_decode_only = false;
+        auto& end_image_data = with_end_images[0];
+        int img_width           = end_image_data.width;
+        int img_height           = end_image_data.height;
+        int img_length = end_image_data.data_len;
+
+        // Determine target dimensions (use gen_params if set, otherwise use source dimensions)
+        int target_width  = gen_params.width_and_height_are_set() ? gen_params.width : img_width;
+        int target_height = gen_params.width_and_height_are_set() ? gen_params.height : img_height;
+
+        uint8_t* image_data = load_image_from_memory((const char *)end_image_data.data, img_length, target_width, target_height);
+        if (image_data == nullptr) {
+            LOG_ERROR("load end image failed");
+            return 1;
+        }
+
+        sd_image_t end_image = {static_cast<uint32_t>(target_width), static_cast<uint32_t>(target_height), 3, image_data};
+        gen_params.end_image = SDImageOwner(end_image);
+        gen_params.set_width_and_height_if_unset(target_width, target_height);
     }
 
     if (gen_params.ref_image_paths.size() > 0) {
@@ -710,6 +739,29 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
                 return 1;
             }
             gen_params.ref_images.push_back(std::move(ref_image));
+        }
+    }
+
+    if (!with_ref_images.empty()) {
+        vae_decode_only = false;
+        for (auto& ref_image : with_ref_images) {
+            int img_width  = ref_image.width;
+            int img_height = ref_image.height;
+            int img_length = ref_image.data_len;
+
+            // Determine target dimensions (use gen_params if set, otherwise use source dimensions)
+            int target_width  = gen_params.width_and_height_are_set() ? gen_params.width : img_width;
+            int target_height = gen_params.width_and_height_are_set() ? gen_params.height : img_height;
+
+            uint8_t* image_data = load_image_from_memory((const char *)ref_image.data, img_length, target_width, target_height);
+            if (image_data == nullptr) {
+                LOG_ERROR("load ref image failed");
+                continue;
+            }
+
+            sd_image_t sd_img = {static_cast<uint32_t>(target_width), static_cast<uint32_t>(target_height), 3, image_data};
+            gen_params.ref_images.emplace_back(sd_img);
+            gen_params.set_width_and_height_if_unset(target_width, target_height);
         }
     }
 
@@ -735,24 +787,26 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
         gen_params.mask_image.reset(generated_mask);
     }
 
-    if (!with_ref_images.empty()) {
+    if (!with_mask_images.empty()) {
         vae_decode_only = false;
-        for (auto& ref_image : with_ref_images) {
-            int img_width           = ref_image.width;
-            int img_height           = ref_image.height;
-            int img_length = ref_image.data_len;
-            uint8_t* raw_pixels = load_image_from_memory((const char *)ref_image.data, img_length, img_width, img_height);
-            if (!raw_pixels) {
-                continue;
-            }
-            sd_image_t sd_image    = {static_cast<uint32_t>(gen_params.width), static_cast<uint32_t>(gen_params.height), 3, nullptr};
-            sd_image.data = load_image_from_memory((const char *)sd_image.data, img_length, img_width, img_height);
-            if (sd_image.data == nullptr) {
-                LOG_ERROR("load image from '%s' failed", gen_params.mask_image_path.c_str());
-                return 1;
-            }
-            gen_params.ref_images.emplace_back(sd_image);
+        auto& mask_image_data = with_mask_images[0];
+        int img_width           = mask_image_data.width;
+        int img_height           = mask_image_data.height;
+        int img_length = mask_image_data.data_len;
+
+        // Determine target dimensions (use gen_params if set, otherwise use source dimensions)
+        int target_width  = gen_params.width_and_height_are_set() ? gen_params.width : img_width;
+        int target_height = gen_params.width_and_height_are_set() ? gen_params.height : img_height;
+
+        uint8_t* image_data = load_image_from_memory((const char *)mask_image_data.data, img_length, target_width, target_height);
+        if (image_data == nullptr) {
+            LOG_ERROR("load mask image failed");
+            return 1;
         }
+
+        sd_image_t mask_image = {static_cast<uint32_t>(target_width), static_cast<uint32_t>(target_height), 3, image_data};
+        gen_params.mask_image = SDImageOwner(mask_image);
+        gen_params.set_width_and_height_if_unset(target_width, target_height);
     }
 
     if (gen_params.control_image_path.size() > 0) {
@@ -763,6 +817,36 @@ int process_logic(int argc, const char* argv[], ImageOutput * image_output, bool
             LOG_ERROR("load image from '%s' failed", gen_params.control_image_path.c_str());
             return 1;
         }
+        if (cli_params.canny_preprocess) {  // apply preprocessor
+            preprocess_canny(gen_params.control_image.get(),
+                             0.08f,
+                             0.08f,
+                             0.8f,
+                             1.0f,
+                             false);
+        }
+    }
+
+    if (!with_control_images.empty()) {
+        auto& control_image_data = with_control_images[0];
+        int img_width           = control_image_data.width;
+        int img_height           = control_image_data.height;
+        int img_length = control_image_data.data_len;
+
+        // Determine target dimensions (use gen_params if set, otherwise use source dimensions)
+        int target_width  = gen_params.width_and_height_are_set() ? gen_params.width : img_width;
+        int target_height = gen_params.width_and_height_are_set() ? gen_params.height : img_height;
+
+        uint8_t* image_data = load_image_from_memory((const char *)control_image_data.data, img_length, target_width, target_height);
+        if (image_data == nullptr) {
+            LOG_ERROR("load control image failed");
+            return 1;
+        }
+
+        sd_image_t control_image = {static_cast<uint32_t>(target_width), static_cast<uint32_t>(target_height), 3, image_data};
+        gen_params.control_image = SDImageOwner(control_image);
+        gen_params.set_width_and_height_if_unset(target_width, target_height);
+
         if (cli_params.canny_preprocess) {  // apply preprocessor
             preprocess_canny(gen_params.control_image.get(),
                              0.08f,
@@ -964,6 +1048,10 @@ extern "C" {
 EXPORT_FUNC ImageOutput * generate_image_data(int argc, const char ** argv, const RefImageDataArray* refImages, const RefImageDataArray* initImages
                                              , const RefImageDataArray* endImages, const RefImageDataArray* maskImages, const RefImageDataArray* controlImages
                                              , const RefImageDataArray* controlVideoImages) {
+    fprintf(stderr, "[DEBUG] generate_image_data called with argc=%d\n", argc);
+    for (int i = 0; i < argc; i++) {
+        fprintf(stderr, "[DEBUG] generate_image_data argv[%d] ptr=%p content='%s'\n", i, (void*)argv[i], argv[i] ? argv[i] : "(null)");
+    }
     sd_set_log_callback(customize_log_callback, nullptr);
     std::vector<RefImageData> with_ref_images;
     std::vector<RefImageData> with_init_images;
